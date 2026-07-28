@@ -1,1 +1,1 @@
-[! diagram](tugasmagang.drawio.png)
+![diagram](tugasmagang.drawio.png)
