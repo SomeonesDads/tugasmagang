@@ -4,9 +4,15 @@
 -- Created: 2026-07-28
 --
 -- Tables:
---   ticket          — base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
---   ticket_rca      — IS-A child; created immediately, filled by engineers
---   ticket_service  — IS-A child; inserted once ticket_rca.end_day is set
+--   ticket                — base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
+--   ticket_rca            — IS-A child; created immediately, filled by engineers
+--   ticket_service        — IS-A child; inserted once ticket_rca.end_day is set
+--
+-- Tracking (refreshed daily by pipeline):
+--   tracking_summary      — district-level aggregate metrics
+--   tracking_detail       — district + RCA-category breakdown
+--   tracking_summary_site — site-level aggregate metrics
+--   tracking_detail_site  — site + RCA-category breakdown
 -- ============================================================
 
 -- DROP TABLE mba_sumbagut.ticket_service;
@@ -215,3 +221,91 @@ CREATE TABLE mba_sumbagut.ticket_service (
 -- Fast lookup for open service tickets (checked daily by pipeline)
 CREATE INDEX idx_ticket_service_open ON mba_sumbagut.ticket_service (ticket_id)
     WHERE end_day IS NULL;
+
+
+-- ============================================================
+-- Tracking Tables
+-- Refreshed at the end of every pipeline run (seed or daily).
+-- All use UPSERT so they are safe to recompute from scratch.
+--
+-- Metrics:
+--   count_problems        total tickets ever opened for this group
+--   solved_rca            tickets where engineer submitted RCA
+--   solved_service        tickets where problem fully cleared from feed
+--   solved_rca_avg_time   avg days: ticket creation → RCA submitted (analysis time)
+--   solved_service_avg_time avg days: service opened → service closed (service time)
+-- ============================================================
+
+
+-- ── mba_sumbagut.tracking_summary (district level) ───────────────────────────
+--
+-- One row per district.  Gives management a quick view of how each district
+-- is performing on ticket resolution.
+
+CREATE TABLE mba_sumbagut.tracking_summary (
+    district                varchar(100)    NOT NULL,
+    count_problems          int4            NOT NULL DEFAULT 0,
+    solved_rca              int4            NOT NULL DEFAULT 0,
+    solved_service          int4            NOT NULL DEFAULT 0,
+    solved_rca_avg_time     numeric(8,2)    NULL,
+    solved_service_avg_time numeric(8,2)    NULL,
+    updated_at              timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT tracking_summary_pkey PRIMARY KEY (district)
+);
+
+
+-- ── mba_sumbagut.tracking_detail (district + RCA category) ───────────────────
+--
+-- One row per (district, rca).  Only tickets that have had an RCA submitted
+-- appear here.  Enables per-cause drilldown within a district.
+
+CREATE TABLE mba_sumbagut.tracking_detail (
+    district                varchar(100)    NOT NULL,
+    rca                     varchar(50)     NOT NULL,
+    count_problems          int4            NOT NULL DEFAULT 0,
+    solved_rca              int4            NOT NULL DEFAULT 0,
+    solved_service          int4            NOT NULL DEFAULT 0,
+    solved_rca_avg_time     numeric(8,2)    NULL,
+    solved_service_avg_time numeric(8,2)    NULL,
+    updated_at              timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT tracking_detail_pkey PRIMARY KEY (district, rca)
+);
+
+CREATE INDEX idx_tracking_detail_district ON mba_sumbagut.tracking_detail (district);
+
+
+-- ── mba_sumbagut.tracking_summary_site (site level) ──────────────────────────
+--
+-- One row per site_id.  Site-granularity version of tracking_summary,
+-- matching the ER diagram.  Useful for surfacing problem sites to engineers.
+
+CREATE TABLE mba_sumbagut.tracking_summary_site (
+    site_id                 varchar(10)     NOT NULL,
+    count_problems          int4            NOT NULL DEFAULT 0,
+    solved_rca              int4            NOT NULL DEFAULT 0,
+    solved_service          int4            NOT NULL DEFAULT 0,
+    solved_rca_avg_time     numeric(8,2)    NULL,
+    solved_service_avg_time numeric(8,2)    NULL,
+    updated_at              timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT tracking_summary_site_pkey PRIMARY KEY (site_id)
+);
+
+
+-- ── mba_sumbagut.tracking_detail_site (site + RCA category) ──────────────────
+--
+-- One row per (site_id, rca).  Site-granularity version of tracking_detail.
+-- Useful for seeing which root causes repeat at a specific site.
+
+CREATE TABLE mba_sumbagut.tracking_detail_site (
+    site_id                 varchar(10)     NOT NULL,
+    rca                     varchar(50)     NOT NULL,
+    count_problems          int4            NOT NULL DEFAULT 0,
+    solved_rca              int4            NOT NULL DEFAULT 0,
+    solved_service          int4            NOT NULL DEFAULT 0,
+    solved_rca_avg_time     numeric(8,2)    NULL,
+    solved_service_avg_time numeric(8,2)    NULL,
+    updated_at              timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT tracking_detail_site_pkey PRIMARY KEY (site_id, rca)
+);
+
+CREATE INDEX idx_tracking_detail_site_site ON mba_sumbagut.tracking_detail_site (site_id);
