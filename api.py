@@ -3,7 +3,12 @@ api.py
 FastAPI REST API for the SRI ZP/ZT ticket system.
 
 Run with:
-    uvicorn api:app --reload
+    uvicorn api:app --reload           (dev)
+    uvicorn api:app --host 0.0.0.0     (prod)
+
+The FastAPI lifespan starts an APScheduler job that fires daily_pipeline()
+every day at PIPELINE_HOUR:PIPELINE_MINUTE (from .env, default 02:00).
+No separate scheduler process is needed.
 
 Endpoints
 ─────────
@@ -17,17 +22,65 @@ Endpoints
                                      Also inserts the ticket_service row.
 """
 
+import logging
+from contextlib import asynccontextmanager
 from datetime import date
 from enum import Enum
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import dotenv_values
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="SRI Ticket API", version="0.1.0")
+from dailypipeline import daily_pipeline
+
+log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  [%(levelname)s]  %(message)s",
+)
+
+
+# ── Scheduler lifespan ────────────────────────────────────────────────────────
+
+def _run_pipeline_safe() -> None:
+    """Wrapper so a pipeline exception never crashes the scheduler thread."""
+    try:
+        daily_pipeline()
+    except Exception:
+        log.exception("[SCHEDULER] Pipeline run failed — will retry on next scheduled run")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the daily scheduler when uvicorn starts; stop it on shutdown."""
+    cfg    = dotenv_values(".env")
+    hour   = int(cfg.get("PIPELINE_HOUR",   2))
+    minute = int(cfg.get("PIPELINE_MINUTE", 0))
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        _run_pipeline_safe,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        id="daily_pipeline",
+        name="Daily ticket pipeline",
+        misfire_grace_time=3600,  # run even if missed by up to 1 h
+        coalesce=True,            # only one run if multiple were missed
+    )
+    scheduler.start()
+    log.info(f"[SCHEDULER] Daily pipeline scheduled at {hour:02d}:{minute:02d} every day")
+
+    yield   # API runs here
+
+    scheduler.shutdown(wait=False)
+    log.info("[SCHEDULER] Scheduler stopped")
+
+
+app = FastAPI(title="SRI Ticket API", version="0.1.0", lifespan=lifespan)
 
 
 # ── DB connection ─────────────────────────────────────────────────────────────
