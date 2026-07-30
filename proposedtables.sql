@@ -1,19 +1,13 @@
--- ============================================================
--- Ticket System — Proposed Tables
--- Schema : mba_sumbagut
--- Created: 2026-07-28
---
 -- Tables:
 --   ticket                — base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
 --   ticket_rca            — IS-A child; created immediately, filled by engineers
 --   ticket_service        — IS-A child; inserted once ticket_rca.end_day is set
 --
--- Tracking (refreshed daily by pipeline):
---   tracking_summary      — district-level aggregate metrics
---   tracking_detail       — district + RCA-category breakdown
---   tracking_summary_site — site-level aggregate metrics
---   tracking_detail_site  — site + RCA-category breakdown
--- ============================================================
+--   Tracking (refreshed daily by pipeline):
+--      tracking_summary      — district-level aggregate metrics
+--      tracking_detail       — district + RCA-category breakdown
+--      tracking_summary_site — site-level aggregate metrics
+--      tracking_detail_site  — site + RCA-category breakdown
 
 -- DROP TABLE mba_sumbagut.ticket_service;
 -- DROP TABLE mba_sumbagut.ticket_rca;
@@ -21,7 +15,7 @@
 -- DROP SEQUENCE mba_sumbagut.ticket_id_seq;
 
 
--- ── Sequence ──────────────────────────────────────────────────────────────────
+-- Sequence 
 
 CREATE SEQUENCE mba_sumbagut.ticket_id_seq
     INCREMENT BY 1
@@ -32,7 +26,7 @@ CREATE SEQUENCE mba_sumbagut.ticket_id_seq
     NO CYCLE;
 
 
--- ── mba_sumbagut.ticket ───────────────────────────────────────────────────────
+--  mba_sumbagut.ticket 
 --
 -- Base ticket. One row per unique anomalous cell per day it first appears.
 --
@@ -95,7 +89,7 @@ CREATE INDEX idx_ticket_created     ON mba_sumbagut.ticket (created_date DESC);
 CREATE INDEX idx_ticket_type        ON mba_sumbagut.ticket (ticket_type);
 
 
--- ── mba_sumbagut.ticket_rca ───────────────────────────────────────────────────
+--  mba_sumbagut.ticket_rca 
 --
 -- IS-A child of ticket. Inserted automatically when a ticket is created.
 -- Engineers populate rca + rca_detail via bot/API.
@@ -197,7 +191,7 @@ CREATE INDEX idx_ticket_rca_pending_svc ON mba_sumbagut.ticket_rca (end_day)
     WHERE end_day IS NOT NULL;
 
 
--- ── mba_sumbagut.ticket_service ───────────────────────────────────────────────
+--  mba_sumbagut.ticket_service 
 --
 -- IS-A child of ticket. Inserted by backend when ticket_rca.end_day is set.
 -- start_day = ticket_rca.end_day.
@@ -237,7 +231,7 @@ CREATE INDEX idx_ticket_service_open ON mba_sumbagut.ticket_service (ticket_id)
 -- ============================================================
 
 
--- ── mba_sumbagut.tracking_summary (district level) ───────────────────────────
+--  mba_sumbagut.tracking_summary (district level) 
 --
 -- One row per district.  Gives management a quick view of how each district
 -- is performing on ticket resolution.
@@ -254,7 +248,7 @@ CREATE TABLE mba_sumbagut.tracking_summary (
 );
 
 
--- ── mba_sumbagut.tracking_detail (district + RCA category) ───────────────────
+--  mba_sumbagut.tracking_detail (district + RCA category) 
 --
 -- One row per (district, rca).  Only tickets that have had an RCA submitted
 -- appear here.  Enables per-cause drilldown within a district.
@@ -274,7 +268,7 @@ CREATE TABLE mba_sumbagut.tracking_detail (
 CREATE INDEX idx_tracking_detail_district ON mba_sumbagut.tracking_detail (district);
 
 
--- ── mba_sumbagut.tracking_summary_site (site level) ──────────────────────────
+--  mba_sumbagut.tracking_summary_site (site level) 
 --
 -- One row per site_id.  Site-granularity version of tracking_summary,
 -- matching the ER diagram.  Useful for surfacing problem sites to engineers.
@@ -291,7 +285,7 @@ CREATE TABLE mba_sumbagut.tracking_summary_site (
 );
 
 
--- ── mba_sumbagut.tracking_detail_site (site + RCA category) ──────────────────
+--  mba_sumbagut.tracking_detail_site (site + RCA category) 
 --
 -- One row per (site_id, rca).  Site-granularity version of tracking_detail.
 -- Useful for seeing which root causes repeat at a specific site.
