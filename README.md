@@ -1,0 +1,1 @@
+![diagram](tugasmagang.drawio.png)
