@@ -1,13 +1,13 @@
 -- Tables:
---   ticket                — base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
---   ticket_rca            — IS-A child; created immediately, filled by engineers
---   ticket_service        — IS-A child; inserted once ticket_rca.end_day is set
+--   ticket                 base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
+--   ticket_rca             IS-A child; created immediately, filled by engineers
+--   ticket_service         IS-A child; inserted once ticket_rca.end_day is set
 --
 --   Tracking (refreshed daily by pipeline):
---      tracking_summary      — district-level aggregate metrics
---      tracking_detail       — district + RCA-category breakdown
---      tracking_summary_site — site-level aggregate metrics
---      tracking_detail_site  — site + RCA-category breakdown
+--      tracking_summary       district-level aggregate metrics
+--      tracking_detail        district + RCA-category breakdown
+--      tracking_summary_site  site-level aggregate metrics
+--      tracking_detail_site   site + RCA-category breakdown
 
 -- DROP TABLE mba_sumbagut.ticket_service;
 -- DROP TABLE mba_sumbagut.ticket_rca;
@@ -30,8 +30,8 @@ CREATE SEQUENCE mba_sumbagut.ticket_id_seq
 --
 -- Base ticket. One row per unique anomalous cell per day it first appears.
 --
--- ZP rows carry (enodeb_id, cell_id) — cell_id/enodeb_id from sri_zp_daily.
--- ZT rows carry (lac, ci)            — from sri_zt_daily, which has no enodeb.
+-- ZP rows carry (enodeb_id, cell_id)  cell_id/enodeb_id from sri_zp_daily.
+-- ZT rows carry (lac, ci)             from sri_zt_daily, which has no enodeb.
 --
 -- district_operation_do is denormalized from site_reference at creation time
 -- so routing is self-contained without a cross-pipeline_run_id join later.
