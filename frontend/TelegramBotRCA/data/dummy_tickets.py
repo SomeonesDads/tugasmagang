@@ -1,0 +1,50 @@
+DUMMY_TICKETS = [
+    {
+        "incident": "INC0001",
+        "customer": "PT Alpha Indonesia",
+        "site": "MDN001",
+        "district": "Medan",
+        "status": "Open",
+        "checked": False,
+    },
+    {
+        "incident": "INC0002",
+        "customer": "PT Beta Nusantara",
+        "site": "MDN002",
+        "district": "Medan",
+        "status": "Open",
+        "checked": False,
+    },
+    {
+        "incident": "INC0003",
+        "customer": "PT Citra Telekom",
+        "site": "BNJ001",
+        "district": "Binjai",
+        "status": "Open",
+        "checked": False,
+    },
+    {
+        "incident": "INC0004",
+        "customer": "PT Delta Jaya",
+        "site": "LBP001",
+        "district": "Lubuk Pakam",
+        "status": "Open",
+        "checked": False,
+    },
+    {
+        "incident": "INC0005",
+        "customer": "PT Elang Media",
+        "site": "TBT001",
+        "district": "Tebing Tinggi",
+        "status": "Open",
+        "checked": False,
+    },
+    {
+        "incident": "INC0006",
+        "customer": "PT Fajar Abadi",
+        "site": "PMS001",
+        "district": "Pematang Siantar",
+        "status": "Open",
+        "checked": False,
+    }
+]
