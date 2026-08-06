@@ -46,7 +46,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Database connection ────────────────────────────────────────────────────────
+#  Database connection 
 
 def get_connection() -> psycopg2.extensions.connection:
     cfg = dotenv_values(".env")

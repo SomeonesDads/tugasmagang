@@ -17,6 +17,19 @@
 
 -- Sequence 
 
+CREATE TABLE mba_sumbagut.tracking_detail_site (
+    site_id                 varchar(10)     NOT NULL,
+    rca                     varchar(50)     NOT NULL,
+    count_problems          int4            NOT NULL DEFAULT 0,
+    solved_rca              int4            NOT NULL DEFAULT 0,
+    solved_service          int4            NOT NULL DEFAULT 0,
+    solved_rca_avg_time     numeric(8,2)    NULL,
+    solved_service_avg_time numeric(8,2)    NULL,
+    updated_at              timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT tracking_detail_site_pkey PRIMARY KEY (site_id, rca)
+);
+
+
 CREATE SEQUENCE mba_sumbagut.ticket_id_seq
     INCREMENT BY 1
     MINVALUE 1
