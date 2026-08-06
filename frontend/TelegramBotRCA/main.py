@@ -1,38 +1,43 @@
-from config import TOKEN
+from config import TOKEN, validate_config
 
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
 from handlers.start import start
 from handlers.management import management, back_to_main
 from handlers.engineer import engineer
-from handlers.ticket import (
-    view_tickets,
-    select_ticket,
-)
+from handlers.notification import notify_engineers
 
-from handlers.rca import (
-    select_rca,
-    select_rca_detail,
+from handlers.ticket import (
+    show_ticket_dashboard,
+    process_text_input,
 )
 
 
 def main():
+    validate_config()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handler /start
+    # ======================================
+    # START
+    # ======================================
+
     app.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
+    app.add_handler(CommandHandler("notify_engineers", notify_engineers))
+
+    # ======================================
+    # MANAGEMENT
+    # ======================================
 
     app.add_handler(
         MessageHandler(
@@ -41,49 +46,48 @@ def main():
         )
     )
 
+    # ======================================
+    # ENGINEER
+    # ======================================
+
     app.add_handler(
-    MessageHandler(
-        filters.Regex(r"^👷 Engineer Field$"),
-        engineer
+        MessageHandler(
+            filters.Regex(r"^👷 Engineer Field"),
+            engineer
         )
     )
 
+    # ======================================
+    # VIEW TICKET
+    # ======================================
+
     app.add_handler(
-    MessageHandler(
-        filters.Regex(r"^🎫 View Tickets$"),
-        view_tickets
+        MessageHandler(
+            filters.Regex(r"^🎫 View Ticket$"),
+            show_ticket_dashboard
         )
     )
 
+    # ======================================
+    # KEMBALI
+    # ======================================
+
     app.add_handler(
-    CallbackQueryHandler(
-        select_ticket,
-        pattern=r"^ticket_.*$"
+        MessageHandler(
+            filters.Regex(r"^⬅️ Kembali$"),
+            back_to_main
         )
     )
 
+    # One text handler routes replies based on the user's current step.
     app.add_handler(
-    CallbackQueryHandler(
-        select_rca,
-        pattern=r"^rca_.*$"
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            process_text_input
         )
     )
 
-    app.add_handler(
-    CallbackQueryHandler(
-        select_rca_detail,
-        pattern=r"^detail_.*$"
-        )
-    )
-
-    app.add_handler(
-    MessageHandler(
-        filters.Regex(r"^⬅️ Kembali$"),
-        back_to_main
-        )
-    )
-
-    print("Bot sedang berjalan...")
+    print("✅ Bot sedang berjalan...")
 
     app.run_polling()
 

@@ -1,79 +1,60 @@
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-
-from data.dummy_rca_detail import DUMMY_RCA_DETAIL
-from data.dummy_tickets import DUMMY_TICKETS
+from api_client import BackendAPIError, get_rca_options, submit_rca
 
 
-async def select_rca(update, context):
+async def input_rca(update, context):
+    if not context.user_data.get("waiting_rca"):
+        return
+    message = update.message.text.strip()
+    if not message.isdigit():
+        await update.message.reply_text("❌ Masukkan nomor RCA.")
+        return
 
-    query = update.callback_query
+    try:
+        options = await get_rca_options()
+    except BackendAPIError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
 
-    await query.answer()
+    categories = list(options)
+    number = int(message)
+    if number < 1 or number > len(categories):
+        await update.message.reply_text("❌ Nomor RCA tidak tersedia.")
+        return
 
-    rca = query.data.replace("rca_", "")
-
-    context.user_data["rca"] = rca
-
-    details = DUMMY_RCA_DETAIL.get(rca, [])
-
-    keyboard = []
-
-    for detail in details:
-
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    text=detail,
-                    callback_data=f"detail_{detail}"
-                )
-            ]
-        )
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        text=(
-            f"📄 RCA : {rca}\n\n"
-            "Silakan pilih RCA Detail."
-        ),
-        reply_markup=reply_markup
-    )
+    rca = categories[number - 1]
+    context.user_data.update(rca=rca, rca_options=options, waiting_rca=False, waiting_detail=True)
+    details = options[rca]
+    text = f"✅ RCA dipilih: {rca}\n\nSilakan pilih RCA Detail.\n\n"
+    text += "\n".join(f"{index}. {detail}" for index, detail in enumerate(details, start=1))
+    text += "\n\nBalas dengan nomor RCA Detail."
+    await update.message.reply_text(text)
 
 
-async def select_rca_detail(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    detail = query.data.replace("detail_", "")
-
-    incident = context.user_data["ticket"]
+async def input_rca_detail(update, context):
+    if not context.user_data.get("waiting_detail"):
+        return
+    message = update.message.text.strip()
+    if not message.isdigit():
+        await update.message.reply_text("❌ Masukkan nomor RCA Detail.")
+        return
 
     rca = context.user_data["rca"]
+    details = context.user_data["rca_options"][rca]
+    number = int(message)
+    if number < 1 or number > len(details):
+        await update.message.reply_text("❌ Nomor RCA Detail tidak tersedia.")
+        return
 
-    for ticket in DUMMY_TICKETS:
+    rca_detail = details[number - 1]
+    ticket = context.user_data["ticket"]
+    try:
+        await submit_rca(ticket["ticket_id"], rca, rca_detail)
+    except BackendAPIError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
 
-        if ticket["incident"] == incident:
-
-            ticket["rca"] = rca
-
-            ticket["rca_detail"] = detail
-
-            ticket["checked"] = True
-
-            break
-
-    await query.edit_message_text(
-
-        text=(
-            "✅ Ticket berhasil di-check.\n\n"
-            f"Incident : {incident}\n"
-            f"RCA : {rca}\n"
-            f"RCA Detail : {detail}"
-        )
-
+    context.user_data["waiting_detail"] = False
+    await update.message.reply_text(
+        "✅ RCA berhasil disimpan.\n\n"
+        f"Tiket: #{ticket['ticket_id']}\nRCA: {rca}\nRCA Detail: {rca_detail}"
     )

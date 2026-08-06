@@ -1,89 +1,91 @@
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import ReplyKeyboardRemove
 
-from data.dummy_tickets import DUMMY_TICKETS
-from data.dummy_rca import DUMMY_RCA
+from api_client import BackendAPIError, get_tickets
+from config import ENGINEER_DISTRICT
 
 
-async def view_tickets(update, context):
+def _ticket_label(ticket):
+    identifiers = ticket["identifiers"]
+    if ticket["ticket_type"] == "ZP":
+        location = f"eNodeB {identifiers['enodeb_id']} / Cell {identifiers['cell_id']}"
+    else:
+        location = f"LAC {identifiers['lac']} / CI {identifiers['ci']}"
+    return f"#{ticket['ticket_id']} ({ticket['ticket_type']}, {location})"
 
-    keyboard = []
 
-    for ticket in DUMMY_TICKETS:
+async def show_ticket_dashboard(update, context):
+    try:
+        payload = await get_tickets(ENGINEER_DISTRICT)
+    except BackendAPIError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
 
-        if not ticket["checked"]:
+    context.user_data["ticket_list"] = []
+    tickets = payload["tickets"]
+    need_servicing = [ticket for ticket in tickets if ticket["status"]["rca"] and not ticket["status"]["serviced"]]
+    need_analyzing = [ticket for ticket in tickets if not ticket["status"]["rca"]]
 
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{ticket['incident']} | {ticket['customer']}",
-                        callback_data=f"ticket_{ticket['incident']}"
-                    )
-                ]
-            )
+    text = f"TICKET DASHBOARD — {payload['district']}\n\nNeed Servicing\n\n"
+    if not need_servicing:
+        text += "Tidak ada tiket.\n\n"
+    else:
+        for ticket in need_servicing:
+            text += f"- {_ticket_label(ticket)}\n  Site: {ticket['site_id']}\n\n"
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    text += "Need Analyzing\n\n"
+    if not need_analyzing:
+        text += "Tidak ada tiket."
+    else:
+        for number, ticket in enumerate(need_analyzing, start=1):
+            text += f"{number}. {_ticket_label(ticket)}\n   Site: {ticket['site_id']} | Aging: {ticket['aging']} hari\n\n"
+            context.user_data["ticket_list"].append(ticket)
+        text += "Balas dengan nomor tiket yang ingin diproses."
 
-    await update.message.reply_text(
-        "📋 Silakan pilih ticket.",
-        reply_markup=reply_markup
-    )
+    context.user_data["waiting_ticket"] = bool(need_analyzing)
+    await update.message.reply_text(text)
 
 
 async def select_ticket(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    incident = query.data.replace("ticket_", "")
-
-    ticket = next(
-        (
-            t for t in DUMMY_TICKETS
-            if t["incident"] == incident
-        ),
-        None
-    )
-
-    if ticket is None:
-
-        await query.edit_message_text(
-            "Ticket tidak ditemukan."
-        )
-
+    if not update.message or not context.user_data.get("waiting_ticket"):
         return
 
-    context.user_data["ticket"] = incident
+    message = update.message.text.strip()
+    if not message.isdigit():
+        await update.message.reply_text("❌ Masukkan nomor tiket.")
+        return
 
-    keyboard = []
+    number = int(message)
+    ticket_list = context.user_data.get("ticket_list", [])
+    if number < 1 or number > len(ticket_list):
+        await update.message.reply_text("❌ Nomor tiket tidak ditemukan.")
+        return
 
-    for rca in DUMMY_RCA:
-
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    rca,
-                    callback_data=f"rca_{rca}"
-                )
-            ]
-        )
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-
-        text=(
-            "📄 DETAIL TICKET\n\n"
-            f"Incident : {ticket['incident']}\n"
-            f"Customer : {ticket['customer']}\n"
-            f"Site : {ticket['site']}\n"
-            f"District : {ticket['district']}\n"
-            f"Status : {ticket['status']}\n\n"
-            "Silakan pilih RCA."
-        ),
-
-        reply_markup=reply_markup
+    ticket = ticket_list[number - 1]
+    context.user_data["ticket"] = ticket
+    context.user_data["waiting_ticket"] = False
+    context.user_data["waiting_rca"] = True
+    await update.message.reply_text(
+        "DETAIL TIKET\n\n"
+        f"Tiket: {_ticket_label(ticket)}\n"
+        f"Site: {ticket['site_id']}\n"
+        f"Aging: {ticket['aging']} hari\n\n"
+        "Silakan masukkan nomor RCA.",
+        reply_markup=ReplyKeyboardRemove(),
     )
+
+
+async def process_text_input(update, context):
+    """Route a text reply to the current ticket/RCA step.
+
+    python-telegram-bot executes only the first matching handler in a group,
+    so this single router is required instead of three overlapping TEXT
+    handlers.
+    """
+    if context.user_data.get("waiting_ticket"):
+        await select_ticket(update, context)
+    elif context.user_data.get("waiting_rca"):
+        from handlers.rca import input_rca
+        await input_rca(update, context)
+    elif context.user_data.get("waiting_detail"):
+        from handlers.rca import input_rca_detail
+        await input_rca_detail(update, context)

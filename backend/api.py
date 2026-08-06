@@ -116,6 +116,45 @@ class RCACategory(str, Enum):
     dismantled  = "Dismantled"
 
 
+# The bot reads this endpoint so its choices always match the database CHECK
+# constraints.  Keep it next to RCACategory whenever the official RCA list is
+# revised.
+RCA_OPTIONS = {
+    "Software Problem": ["Configuration Problem", "Database"],
+    "Activity Project": ["Cell Locked", "Activity Event", "Activity Upgrade", "Activity Downgrade", "Activity Blacksite"],
+    "Hardware Problem": ["DAS Problem", "Hardware Hang, No Alarm", "Baseband Problem", "UMPT/UBBP Problem", "Antenna Problem", "Antenna Port Problem", "Flexible Jumper", "RRU Problem", "SFP Problem", "GPS Problem", "Optic Problem"],
+    "Power Problem": ["Rectifier Problem", "Kabel Power Problem", "Genset Problem", "Pemadaman PLN"],
+    "Transmition Problem": ["NPU Problem", "MMU Problem", "RAU Problem", "Metro-E Problem", "VLAN Problem", "Impact Simpul", "Fading"],
+    "Stolen": ["stolen Baseband", "Stolen RRU", "Stolen BBU", "Stolen UBBP", "Stolen UMPT", "Stolen UBBP + UMPT", "Stolen Cable Power"],
+    "Force Majure": ["Banjir", "Site Rubuh", "Perangkat Terbakar"],
+    "Comcase": ["Comcase"],
+    "Sleeping Cell": ["Sleeping Cell"],
+    "No Traffic/User": ["No Traffic/User"],
+    "Dismantled": ["Dismantled"],
+}
+
+MOCK_ENGINEER_TICKETS = {
+    8887960178: {
+        "district": "DISTRICT-8887960178",
+        "tickets": [
+            {"ticket_id": 10001 + index, "ticket_type": "ZP", "site_id": f"MDN{index + 1:03d}",
+             "identifiers": {"enodeb_id": 41001 + index, "cell_id": index + 1},
+             "aging": 5 - index, "status": {"rca": False, "serviced": False}}
+            for index in range(5)
+        ],
+    },
+    8510386982: {
+        "district": "DISTRICT-8510386982",
+        "tickets": [
+            {"ticket_id": 10006 + index, "ticket_type": "ZT", "site_id": f"BJM{index + 1:03d}",
+             "identifiers": {"lac": 52001 + index, "ci": 62001 + index},
+             "aging": 5 - index, "status": {"rca": False, "serviced": False}}
+            for index in range(5)
+        ],
+    },
+}
+
+
 # ── Response / Request models ─────────────────────────────────────────────────
 
 class TicketStatus(BaseModel):
@@ -154,17 +193,37 @@ class RCAPatch(BaseModel):
     rca_detail: str           # free text; DB CHECK constraint validates allowed values
 
 
+@app.get("/api/rca-options", summary="RCA categories and valid detail values")
+def get_rca_options():
+    """Return the valid RCA values for API consumers such as the Telegram bot."""
+    return RCA_OPTIONS
+
+
 # ── GET /api/engineers ────────────────────────────────────────────────────────
 
-@app.get("/api/engineers", summary="List engineer telegram IDs [SCAFFOLD]")
+@app.get("/api/engineers", summary="List engineer telegram IDs [MOCK]")
 def get_engineers():
     """
-    SCAFFOLD — returns the list of engineer telegram IDs.
-    Engineer ↔ district mapping table is not yet set up.
-    Replace this body with a real DB query once the table exists.
+    Temporary mock data while the engineer table and Telegram ID mapping are
+    not available. Replace this body with a DB query once the mapping exists.
     """
-    # TODO: SELECT tele_id, name FROM mba_sumbagut.engineer WHERE is_active = true
-    return {"engineers": []}
+    return {"engineers": [8887960178, 8510386982]}
+
+
+@app.get(
+    "/api/mock/engineers/{telegram_id}/tickets",
+    response_model=TicketsResponse,
+    summary="Five mock tickets assigned to an engineer",
+)
+def get_mock_engineer_tickets(telegram_id: int):
+    """Temporary ticket assignment used to test Telegram notifications."""
+    assignment = MOCK_ENGINEER_TICKETS.get(telegram_id)
+    if assignment is None:
+        raise HTTPException(status_code=404, detail=f"Engineer {telegram_id} not found.")
+    return {
+        "district": assignment["district"],
+        "tickets": assignment["tickets"],
+    }
 
 
 # ── GET /api/tickets/{district_id} ────────────────────────────────────────────

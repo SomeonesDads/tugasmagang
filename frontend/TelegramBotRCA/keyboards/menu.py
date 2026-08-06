@@ -9,10 +9,10 @@ def main_menu():
 
     return ReplyKeyboardMarkup(
         keyboard,
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False
     )
 
-data = {"sectorId"}
 
 def management_menu():
     keyboard = [
@@ -24,20 +24,19 @@ def management_menu():
 
     return ReplyKeyboardMarkup(
         keyboard,
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False
     )
 
 
 def engineer_menu():
     keyboard = [
-        ["🎫 Ambil Ticket"],
-        ["✅ Solve Ticket"],
-        ["📝 RCA"],
-        ["📄 RCA Detail"],
+        ["🎫 View Ticket"],
         ["⬅️ Kembali"],
     ]
 
     return ReplyKeyboardMarkup(
         keyboard,
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False
     )
