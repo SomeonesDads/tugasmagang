@@ -1,0 +1,18 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env.production
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+
+  telegram-bot:
+    build:
+      context: ./frontend/TelegramBotRCA
+    env_file:
+      - ./frontend/TelegramBotRCA/.env.production
+    restart: unless-stopped
+    depends_on:
+      - backend

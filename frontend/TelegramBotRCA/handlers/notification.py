@@ -3,6 +3,7 @@
 from telegram.error import TelegramError
 
 from api_client import BackendAPIError, get_engineers, get_mock_engineer_tickets
+from config import ENGINEER_DISTRICT
 
 
 def _ticket_line(ticket):
@@ -17,7 +18,7 @@ def _ticket_line(ticket):
 async def notify_engineers(update, context):
     """Send each mock engineer their five currently assigned mock tickets."""
     try:
-        engineers = (await get_engineers())["engineers"]
+        engineers = (await get_engineers(ENGINEER_DISTRICT))["engineers"]
     except BackendAPIError as exc:
         await update.effective_message.reply_text(f"❌ {exc}")
         return

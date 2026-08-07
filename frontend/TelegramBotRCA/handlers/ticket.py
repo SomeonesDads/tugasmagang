@@ -1,7 +1,6 @@
 from telegram import ReplyKeyboardRemove
 
 from api_client import BackendAPIError, get_tickets
-from config import ENGINEER_DISTRICT
 
 
 def _ticket_label(ticket):
@@ -15,7 +14,8 @@ def _ticket_label(ticket):
 
 async def show_ticket_dashboard(update, context):
     try:
-        payload = await get_tickets(ENGINEER_DISTRICT)
+        telegram_id = update.effective_user.id
+        payload = await get_tickets(telegram_id)
     except BackendAPIError as exc:
         await update.message.reply_text(f"❌ {exc}")
         return
