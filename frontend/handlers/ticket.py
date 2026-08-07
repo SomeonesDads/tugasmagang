@@ -30,14 +30,14 @@ async def show_ticket_dashboard(update, context):
         text += "Tidak ada tiket.\n\n"
     else:
         for ticket in need_servicing:
-            text += f"- {_ticket_label(ticket)}\n  Site: {ticket['site_id']}\n\n"
+            text += f"- {_ticket_label(ticket)}\n  Site: {ticket['site_id']} | Class: {ticket['site_class']}\n\n"
 
     text += "Need Analyzing\n\n"
     if not need_analyzing:
         text += "Tidak ada tiket."
     else:
         for number, ticket in enumerate(need_analyzing, start=1):
-            text += f"{number}. {_ticket_label(ticket)}\n   Site: {ticket['site_id']} | Aging: {ticket['aging']} hari\n\n"
+            text += f"{number}. {_ticket_label(ticket)}\n   Site: {ticket['site_id']} | Class: {ticket['site_class']} | Aging: {ticket['aging']} hari\n\n"
             context.user_data["ticket_list"].append(ticket)
         text += "Balas dengan nomor tiket yang ingin diproses."
 
@@ -67,7 +67,7 @@ async def select_ticket(update, context):
     await update.message.reply_text(
         "DETAIL TIKET\n\n"
         f"Tiket: {_ticket_label(ticket)}\n"
-        f"Site: {ticket['site_id']}\n"
+        f"Site: {ticket['site_id']} | Class: {ticket['site_class']}\n"
         f"Aging: {ticket['aging']} hari\n\n"
         "Silakan masukkan nomor RCA.",
         reply_markup=ReplyKeyboardRemove(),

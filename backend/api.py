@@ -145,6 +145,7 @@ class TicketOut(BaseModel):
     site_id:     str
     identifiers: Identifiers
     aging:       int
+    site_class:  str
  
 
 class TicketGroups(BaseModel):
@@ -323,6 +324,7 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
             site_id=row["site_id"],
             identifiers=identifiers,
             aging=row["aging"],
+            site_class=getsiteclass(row["site_id"]),
         )
         priority = (
             0.4 * _aging_score(ticket.aging)
