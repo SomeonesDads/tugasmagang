@@ -10,9 +10,9 @@ services:
 
   telegram-bot:
     build:
-      context: ./frontend/TelegramBotRCA
+      context: ./frontend
     env_file:
-      - ./frontend/TelegramBotRCA/.env.production
+      - ./frontend/.env.production
     restart: unless-stopped
     depends_on:
       - backend

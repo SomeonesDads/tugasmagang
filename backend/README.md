@@ -91,7 +91,7 @@ Salin contoh konfigurasi lalu isi token bot yang aktif dari BotFather:
 Copy-Item .\frontend\TelegramBotRCA\.env.example .\frontend\TelegramBotRCA\.env
 ```
 
-Isi `frontend/TelegramBotRCA/.env` seperti berikut:
+Isi `frontend/.env` seperti berikut:
 
 ```env
 TELEGRAM_BOT_TOKEN=token_baru_dari_botfather

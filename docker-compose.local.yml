@@ -49,7 +49,7 @@ services:
   telegram-bot:
     profiles: ["bot"]
     build:
-      context: ./frontend/TelegramBotRCA
+      context: ./frontend
     environment:
       NODE_ENV: development
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-replace_me}
