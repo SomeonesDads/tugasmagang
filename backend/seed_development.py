@@ -74,7 +74,7 @@ def main():
                 cur.execute("""
                     INSERT INTO mba_sumbagut.ticket
                         (ticket_type, enodeb_id, cell_id, lac, ci,
-                         site_id, district_operation_do, created_date, aging)
+                         site_id, district_operation_do, aging, created_date)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING ticket_id

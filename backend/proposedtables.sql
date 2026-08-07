@@ -154,11 +154,11 @@ CREATE TABLE mba_sumbagut.ticket_rca (
     CONSTRAINT ticket_rca_pkey PRIMARY KEY (ticket_id),
     CONSTRAINT ticket_rca_fkey FOREIGN KEY (ticket_id)
         REFERENCES mba_sumbagut.ticket (ticket_id),
-    ticket_rca_rca_fkey FOREIGN KEY (rca_id)
+    CONSTRAINT ticket_rca_rca_fkey FOREIGN KEY (rca_id)
         REFERENCES mba_sumbagut.rca (rca_id),
-    ticket_rca_detail_fkey FOREIGN KEY (rca_detail_id)
+    CONSTRAINT ticket_rca_detail_fkey FOREIGN KEY (rca_detail_id)
         REFERENCES mba_sumbagut.rca_detail (rca_detail_id),
-    ticket_rca_detail_pair_fkey FOREIGN KEY (rca_detail_id, rca_id)
+    CONSTRAINT ticket_rca_detail_pair_fkey FOREIGN KEY (rca_detail_id, rca_id)
         REFERENCES mba_sumbagut.rca_detail (rca_detail_id, rca_id),
     CONSTRAINT chk_ticket_rca_pair CHECK (
         (rca_id IS NULL AND rca_detail_id IS NULL) OR

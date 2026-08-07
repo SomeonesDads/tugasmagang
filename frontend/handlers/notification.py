@@ -18,7 +18,12 @@ def _ticket_line(ticket):
 async def notify_engineers(update, context):
     """Send each mock engineer their five currently assigned mock tickets."""
     try:
-        engineers = (await get_engineers(ENGINEER_DISTRICT))["engineers"]
+        assignments = (await get_engineers())["engineers"]
+        engineers = [
+            assignment["telegram_id"]
+            for assignment in assignments
+            if assignment["district_id"] == ENGINEER_DISTRICT
+        ]
     except BackendAPIError as exc:
         await update.effective_message.reply_text(f"❌ {exc}")
         return

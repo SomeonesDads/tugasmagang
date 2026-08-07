@@ -41,8 +41,8 @@ async def get_tickets(telegram_id):
     return await _request("GET", f"/tickets/{telegram_id}")
 
 
-async def get_engineers(district):
-    return await _request("GET", f"/engineers/{district}")
+async def get_engineers():
+    return await _request("GET", "/engineers")
 
 
 async def get_mock_engineer_tickets(telegram_id):
