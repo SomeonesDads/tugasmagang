@@ -9,6 +9,8 @@
 --      tracking_summary_site  site-level aggregate metrics
 --      tracking_detail_site   site + RCA-category breakdown
 
+CREATE SCHEMA IF NOT EXISTS mba_sumbagut;
+
 -- DROP TABLE mba_sumbagut.ticket_service;
 -- DROP TABLE mba_sumbagut.ticket_rca;
 -- DROP TABLE mba_sumbagut.ticket;
@@ -16,19 +18,6 @@
 
 
 -- Sequence 
-
-CREATE TABLE mba_sumbagut.tracking_detail_site (
-    site_id                 varchar(10)     NOT NULL,
-    rca                     varchar(50)     NOT NULL,
-    count_problems          int4            NOT NULL DEFAULT 0,
-    solved_rca              int4            NOT NULL DEFAULT 0,
-    solved_service          int4            NOT NULL DEFAULT 0,
-    solved_rca_avg_time     numeric(8,2)    NULL,
-    solved_service_avg_time numeric(8,2)    NULL,
-    updated_at              timestamptz     NOT NULL DEFAULT now(),
-    CONSTRAINT tracking_detail_site_pkey PRIMARY KEY (site_id, rca)
-);
-
 
 CREATE SEQUENCE mba_sumbagut.ticket_id_seq
     INCREMENT BY 1
@@ -101,6 +90,21 @@ CREATE INDEX idx_ticket_district    ON mba_sumbagut.ticket (district_operation_d
 CREATE INDEX idx_ticket_created     ON mba_sumbagut.ticket (created_date DESC);
 CREATE INDEX idx_ticket_type        ON mba_sumbagut.ticket (ticket_type);
 
+-- Telegram routing assignments. These are intentionally standalone lookup
+-- rows: there are no foreign keys to district, engineer, or role tables.
+CREATE TABLE mba_sumbagut.telegram_district_role (
+    telegram_id             bigint          NOT NULL,
+    district_operation_do   varchar(100)    NOT NULL,
+    role                    varchar(20)     NOT NULL,
+    CONSTRAINT telegram_district_role_pkey
+        PRIMARY KEY (telegram_id, district_operation_do, role),
+    CONSTRAINT chk_telegram_district_role_role
+        CHECK (role IN ('engineer', 'manager'))
+);
+
+CREATE INDEX idx_telegram_district_role_district
+    ON mba_sumbagut.telegram_district_role (district_operation_do, role);
+
 
 --  mba_sumbagut.ticket_rca 
 --
@@ -109,15 +113,40 @@ CREATE INDEX idx_ticket_type        ON mba_sumbagut.ticket (ticket_type);
 -- Setting rca marks the analysis complete → end_day is set → ticket_service row
 -- is inserted by the backend.
 --
--- RCA values come from the official enum provided 2026-07-28.
+-- RCA definitions are normalized into rca and rca_detail. Additions are made
+-- by inserting rows into those tables; the ticket schema does not change.
+
+CREATE TABLE mba_sumbagut.rca (
+    rca_id      bigserial       NOT NULL,
+    name        varchar(50)    NOT NULL,
+    active      boolean        NOT NULL DEFAULT true,
+    created_at  timestamptz    NOT NULL DEFAULT now(),
+    CONSTRAINT rca_pkey PRIMARY KEY (rca_id),
+    CONSTRAINT uq_rca_name UNIQUE (name)
+);
+
+CREATE TABLE mba_sumbagut.rca_detail (
+    rca_detail_id bigserial       NOT NULL,
+    rca_id        bigint          NOT NULL,
+    name          varchar(100)   NOT NULL,
+    active        boolean        NOT NULL DEFAULT true,
+    created_at    timestamptz    NOT NULL DEFAULT now(),
+    CONSTRAINT rca_detail_pkey PRIMARY KEY (rca_detail_id),
+    CONSTRAINT rca_detail_rca_fkey FOREIGN KEY (rca_id)
+        REFERENCES mba_sumbagut.rca (rca_id),
+    CONSTRAINT uq_rca_detail_name UNIQUE (rca_id, name),
+    CONSTRAINT uq_rca_detail_pair UNIQUE (rca_detail_id, rca_id)
+);
+
+CREATE INDEX idx_rca_detail_rca_id ON mba_sumbagut.rca_detail (rca_id);
 
 CREATE TABLE mba_sumbagut.ticket_rca (
     ticket_id       bigint          NOT NULL,
     start_day       date            NOT NULL,
     end_day         date            NULL,       -- NULL until engineer submits RCA
 
-    rca             varchar(50)     NULL,
-    rca_detail      text            NULL,
+    rca_id          bigint          NULL,
+    rca_detail_id   bigint          NULL,
 
     submitted_at    timestamptz     NULL,
     updated_at      timestamptz     NOT NULL DEFAULT now(),
@@ -125,74 +154,16 @@ CREATE TABLE mba_sumbagut.ticket_rca (
     CONSTRAINT ticket_rca_pkey PRIMARY KEY (ticket_id),
     CONSTRAINT ticket_rca_fkey FOREIGN KEY (ticket_id)
         REFERENCES mba_sumbagut.ticket (ticket_id),
-
-    CONSTRAINT chk_rca CHECK (rca IS NULL OR rca IN (
-        'Software Problem',
-        'Activity Project',
-        'Hardware Problem',
-        'Power Problem',
-        'Transmition Problem',
-        'Stolen',
-        'Force Majure',
-        'Comcase',
-        'Sleeping Cell',
-        'No Traffic/User',
-        'Dismantled'
-    )),
-
-    CONSTRAINT chk_rca_detail CHECK (rca_detail IS NULL OR rca_detail IN (
-        -- Software Problem
-        'Configuration Problem',
-        'Database',
-        -- Activity Project
-        'Cell Locked',
-        'Activity Event',
-        'Activity Upgrade',
-        'Activity Downgrade',
-        'Activity Blacksite',
-        -- Hardware Problem
-        'DAS Problem',
-        'Hardware Hang, No Alarm',
-        'Baseband Problem',
-        'UMPT/UBBP Problem',
-        'Antenna Problem',
-        'Antenna Port Problem',
-        'Flexible Jumper',
-        'RRU Problem',
-        'SFP Problem',
-        'GPS Problem',
-        'Optic Problem',
-        -- Power Problem
-        'Rectifier Problem',
-        'Kabel Power Problem',
-        'Genset Problem',
-        'Pemadaman PLN',
-        -- Transmition Problem
-        'NPU Problem',
-        'MMU Problem',
-        'RAU Problem',
-        'Metro-E Problem',
-        'VLAN Problem',
-        'Impact Simpul',
-        'Fading',
-        -- Stolen
-        'stolen Baseband',
-        'Stolen RRU',
-        'Stolen BBU',
-        'Stolen UBBP',
-        'Stolen UMPT',
-        'Stolen UBBP + UMPT',
-        'Stolen Cable Power',
-        -- Force Majure
-        'Banjir',
-        'Site Rubuh',
-        'Perangkat Terbakar',
-        -- Single-value RCAs (rca_detail mirrors rca)
-        'Comcase',
-        'Sleeping Cell',
-        'No Traffic/User',
-        'Dismantled'
-    ))
+    ticket_rca_rca_fkey FOREIGN KEY (rca_id)
+        REFERENCES mba_sumbagut.rca (rca_id),
+    ticket_rca_detail_fkey FOREIGN KEY (rca_detail_id)
+        REFERENCES mba_sumbagut.rca_detail (rca_detail_id),
+    ticket_rca_detail_pair_fkey FOREIGN KEY (rca_detail_id, rca_id)
+        REFERENCES mba_sumbagut.rca_detail (rca_detail_id, rca_id),
+    CONSTRAINT chk_ticket_rca_pair CHECK (
+        (rca_id IS NULL AND rca_detail_id IS NULL) OR
+        (rca_id IS NOT NULL AND rca_detail_id IS NOT NULL)
+    )
 );
 
 -- Fast lookup for open RCA tickets (awaiting engineer input)
@@ -268,14 +239,16 @@ CREATE TABLE mba_sumbagut.tracking_summary (
 
 CREATE TABLE mba_sumbagut.tracking_detail (
     district                varchar(100)    NOT NULL,
-    rca                     varchar(50)     NOT NULL,
+    rca_id                  bigint          NOT NULL,
     count_problems          int4            NOT NULL DEFAULT 0,
     solved_rca              int4            NOT NULL DEFAULT 0,
     solved_service          int4            NOT NULL DEFAULT 0,
     solved_rca_avg_time     numeric(8,2)    NULL,
     solved_service_avg_time numeric(8,2)    NULL,
     updated_at              timestamptz     NOT NULL DEFAULT now(),
-    CONSTRAINT tracking_detail_pkey PRIMARY KEY (district, rca)
+    CONSTRAINT tracking_detail_pkey PRIMARY KEY (district, rca_id),
+    CONSTRAINT tracking_detail_rca_fkey FOREIGN KEY (rca_id)
+        REFERENCES mba_sumbagut.rca (rca_id)
 );
 
 CREATE INDEX idx_tracking_detail_district ON mba_sumbagut.tracking_detail (district);
@@ -305,14 +278,16 @@ CREATE TABLE mba_sumbagut.tracking_summary_site (
 
 CREATE TABLE mba_sumbagut.tracking_detail_site (
     site_id                 varchar(10)     NOT NULL,
-    rca                     varchar(50)     NOT NULL,
+    rca_id                  bigint          NOT NULL,
     count_problems          int4            NOT NULL DEFAULT 0,
     solved_rca              int4            NOT NULL DEFAULT 0,
     solved_service          int4            NOT NULL DEFAULT 0,
     solved_rca_avg_time     numeric(8,2)    NULL,
     solved_service_avg_time numeric(8,2)    NULL,
     updated_at              timestamptz     NOT NULL DEFAULT now(),
-    CONSTRAINT tracking_detail_site_pkey PRIMARY KEY (site_id, rca)
+    CONSTRAINT tracking_detail_site_pkey PRIMARY KEY (site_id, rca_id),
+    CONSTRAINT tracking_detail_site_rca_fkey FOREIGN KEY (rca_id)
+        REFERENCES mba_sumbagut.rca (rca_id)
 );
 
 CREATE INDEX idx_tracking_detail_site_site ON mba_sumbagut.tracking_detail_site (site_id);

@@ -2,6 +2,65 @@
 
 # Menjalankan Backend dan Bot Telegram
 
+## Environment modes
+
+The backend accepts `NODE_ENV=development`, `staging`, or `production`.
+`prod` is accepted as an alias for `production`. Database settings use the
+`DATABASE_*` variables documented in the example files.
+
+### Local development
+
+Development is disposable and does not use the office database. Start the
+local PostgreSQL, backend, and idempotent development seed with:
+
+```powershell
+docker compose -f .\docker-compose.local.yml up --build
+```
+
+The API is available at `http://127.0.0.1:8000`. The seed uses only
+`proposedtables.sql`, inserts sample tickets and Telegram assignments, and
+leaves the production pipeline disabled. To reset the database completely:
+
+```powershell
+docker compose -f .\docker-compose.local.yml down -v
+```
+
+To run the Telegram bot in Docker, set `TELEGRAM_BOT_TOKEN` in the shell and
+enable its Compose profile:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "your-token"
+docker compose -f .\docker-compose.local.yml --profile bot up --build
+```
+
+### Staging
+
+Copy `backend/.env.staging.example` to `backend/.env.staging`, fill in the
+staging database values, and run the backend locally or with:
+
+```powershell
+docker compose -f .\docker-compose.staging.yml up --build
+```
+
+The Telegram bot remains a local process and should use its local staging
+`.env` with `API_BASE_URL=http://127.0.0.1:8000/api`.
+
+### Production
+
+Copy the production example files to `.env.production` files, fill them from
+the infrastructure team's database and Telegram values, and deploy the
+Compose stack on the office VM:
+
+```bash
+docker compose -f docker-compose.production.yml up -d --build
+```
+
+Production Compose does not create a database container; it connects to the
+approved production database through injected `DATABASE_*` variables. Never
+commit the production env files. SSH port, database host/port, firewall rules,
+Docker installation, and the production database credentials are still needed
+from infrastructure before deployment.
+
 Panduan ini menjalankan backend FastAPI serta bot Telegram secara lokal di
 Windows/PowerShell. Bot membaca tiket dari backend dan command
 `/notify_engineers` mengirim lima tiket mock ke masing-masing engineer:
@@ -40,8 +99,9 @@ API_BASE_URL=http://127.0.0.1:8000/api
 ENGINEER_DISTRICT=DISTRICT-8887960178
 ```
 
-`ENGINEER_DISTRICT` dipakai untuk menu **View Ticket** pada bot. Untuk uji
-notifikasi mock, pembagian tiket tidak bergantung pada nilai ini.
+`ENGINEER_DISTRICT` dipakai untuk memilih district saat mengirim notifikasi.
+Menu **View Ticket** sekarang mengirimkan Telegram ID pengguna ke backend; the
+backend resolves that engineer's district from `telegram_district_role`.
 
 > Jangan commit file `.env` atau membagikan token bot. Bila token pernah
 > tersimpan di source code, buat token baru melalui BotFather sebelum menjalankan bot.
@@ -59,11 +119,31 @@ uvicorn api:app --reload
 Backend tersedia pada `http://127.0.0.1:8000`; dokumentasi endpoint ada di
 `http://127.0.0.1:8000/docs`.
 
+After migrating `proposedtables.sql`, seed the normalized RCA lookup tables
+from the backend directory:
+
+```powershell
+python .\seed_rca.py
+```
+
+The command is safe to rerun. The bot reads RCA categories and details through
+`GET /api/rca-options`; it does not contain local dummy RCA data.
+
 Untuk memastikan data mock tersedia, dari terminal lain jalankan:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/api/engineers
+Invoke-RestMethod http://127.0.0.1:8000/api/engineers/DISTRICT-8887960178
+Invoke-RestMethod http://127.0.0.1:8000/api/tickets/8887960178
 Invoke-RestMethod http://127.0.0.1:8000/api/mock/engineers/8887960178/tickets
+```
+
+Engineer routing rows can be added directly after migrating the schema:
+
+```sql
+INSERT INTO mba_sumbagut.telegram_district_role
+    (telegram_id, district_operation_do, role)
+VALUES
+    (8887960178, 'DISTRICT-8887960178', 'engineer');
 ```
 
 ## 4. Jalankan bot

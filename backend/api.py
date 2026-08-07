@@ -12,12 +12,8 @@ No separate scheduler process is needed.
 
 Endpoints
 ─────────
-  GET  /api/engineers              — SCAFFOLD: placeholder until engineer table
-                                     is set up by your team. Returns empty list.
-  GET  /api/tickets/{district_id}  — All tickets for a district.
-                                     `district_id` = district_operation_do string.
-                                     Once engineers ↔ districts are mapped, swap
-                                     the path param for tele_id and resolve here.
+  GET  /api/engineers/{district_id} — Engineer Telegram IDs assigned to district.
+  GET  /api/tickets/{telegram_id}  — Tickets for the engineer's assigned district.
   PATCH /api/tickets/{ticket_id}   — Submit RCA + RCA detail for a ticket.
                                      Also inserts the ticket_service row.
 """
@@ -25,18 +21,17 @@ Endpoints
 import logging
 from contextlib import asynccontextmanager
 from datetime import date
-from enum import Enum
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import dotenv_values
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from dailypipeline import daily_pipeline
+from settings import settings
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -58,9 +53,13 @@ def _run_pipeline_safe() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start the daily scheduler when uvicorn starts; stop it on shutdown."""
-    cfg    = dotenv_values(".env")
-    hour   = int(cfg.get("PIPELINE_HOUR",   2))
-    minute = int(cfg.get("PIPELINE_MINUTE", 0))
+    if not settings.pipeline_enabled:
+        log.info("[SCHEDULER] Disabled for NODE_ENV=%s", settings.node_env)
+        yield
+        return
+
+    hour = settings.pipeline_hour
+    minute = settings.pipeline_minute
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(
@@ -86,52 +85,18 @@ app = FastAPI(title="SRI Ticket API", version="0.1.0", lifespan=lifespan)
 # ── DB connection ─────────────────────────────────────────────────────────────
 
 def get_db():
-    cfg = dotenv_values(".env")
     conn = psycopg2.connect(
-        host=cfg.get("host", "localhost"),
-        port=int(cfg.get("port", 5432)),
-        dbname=cfg.get("dbname", "postgres"),
-        user=cfg.get("user", "postgres"),
-        password=cfg.get("password", ""),
+        host=settings.database_host,
+        port=settings.database_port,
+        dbname=settings.database_name,
+        user=settings.database_user,
+        password=settings.database_password,
     )
     try:
         yield conn
     finally:
         conn.close()
 
-
-# ── RCA enum (matches CHECK constraint in ticket_rca) ─────────────────────────
-
-class RCACategory(str, Enum):
-    software    = "Software Problem"
-    activity    = "Activity Project"
-    hardware    = "Hardware Problem"
-    power       = "Power Problem"
-    transmition = "Transmition Problem"
-    stolen      = "Stolen"
-    force_majure = "Force Majure"
-    comcase     = "Comcase"
-    sleeping_cell = "Sleeping Cell"
-    no_traffic  = "No Traffic/User"
-    dismantled  = "Dismantled"
-
-
-# The bot reads this endpoint so its choices always match the database CHECK
-# constraints.  Keep it next to RCACategory whenever the official RCA list is
-# revised.
-RCA_OPTIONS = {
-    "Software Problem": ["Configuration Problem", "Database"],
-    "Activity Project": ["Cell Locked", "Activity Event", "Activity Upgrade", "Activity Downgrade", "Activity Blacksite"],
-    "Hardware Problem": ["DAS Problem", "Hardware Hang, No Alarm", "Baseband Problem", "UMPT/UBBP Problem", "Antenna Problem", "Antenna Port Problem", "Flexible Jumper", "RRU Problem", "SFP Problem", "GPS Problem", "Optic Problem"],
-    "Power Problem": ["Rectifier Problem", "Kabel Power Problem", "Genset Problem", "Pemadaman PLN"],
-    "Transmition Problem": ["NPU Problem", "MMU Problem", "RAU Problem", "Metro-E Problem", "VLAN Problem", "Impact Simpul", "Fading"],
-    "Stolen": ["stolen Baseband", "Stolen RRU", "Stolen BBU", "Stolen UBBP", "Stolen UMPT", "Stolen UBBP + UMPT", "Stolen Cable Power"],
-    "Force Majure": ["Banjir", "Site Rubuh", "Perangkat Terbakar"],
-    "Comcase": ["Comcase"],
-    "Sleeping Cell": ["Sleeping Cell"],
-    "No Traffic/User": ["No Traffic/User"],
-    "Dismantled": ["Dismantled"],
-}
 
 MOCK_ENGINEER_TICKETS = {
     8887960178: {
@@ -189,25 +154,44 @@ class TicketsResponse(BaseModel):
 
 
 class RCAPatch(BaseModel):
-    rca:        RCACategory   # validated here; DB CHECK constraint is the final guard
-    rca_detail: str           # free text; DB CHECK constraint validates allowed values
+    rca:        str
+    rca_detail: str
 
 
 @app.get("/api/rca-options", summary="RCA categories and valid detail values")
-def get_rca_options():
-    """Return the valid RCA values for API consumers such as the Telegram bot."""
-    return RCA_OPTIONS
+def get_rca_options(conn=Depends(get_db)):
+    """Read active RCA categories and details from normalized lookup tables."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT r.name, d.name
+            FROM mba_sumbagut.rca r
+            LEFT JOIN mba_sumbagut.rca_detail d
+              ON d.rca_id = r.rca_id AND d.active
+            WHERE r.active
+            ORDER BY r.rca_id, d.rca_detail_id
+        """)
+        options = {}
+        for category, detail in cur.fetchall():
+            options.setdefault(category, [])
+            if detail is not None:
+                options[category].append(detail)
+    return options
 
 
-# ── GET /api/engineers ────────────────────────────────────────────────────────
+# ── GET /api/engineers/{district_id} ─────────────────────────────────────────
 
-@app.get("/api/engineers", summary="List engineer telegram IDs [MOCK]")
-def get_engineers():
-    """
-    Temporary mock data while the engineer table and Telegram ID mapping are
-    not available. Replace this body with a DB query once the mapping exists.
-    """
-    return {"engineers": [8887960178, 8510386982]}
+@app.get("/api/engineers/{district_id}", summary="List engineers assigned to a district")
+def get_engineers(district_id: str, conn=Depends(get_db)):
+    """Return Telegram IDs whose standalone assignment row marks them engineer."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT telegram_id
+            FROM mba_sumbagut.telegram_district_role
+            WHERE district_operation_do = %s
+              AND role = 'engineer'
+            ORDER BY telegram_id
+        """, (district_id,))
+        return {"engineers": [row[0] for row in cur.fetchall()]}
 
 
 @app.get(
@@ -226,22 +210,41 @@ def get_mock_engineer_tickets(telegram_id: int):
     }
 
 
-# ── GET /api/tickets/{district_id} ────────────────────────────────────────────
+# ── GET /api/tickets/{telegram_id} ───────────────────────────────────────────
 
 @app.get(
-    "/api/tickets/{district_id}",
+    "/api/tickets/{telegram_id}",
     response_model=TicketsResponse,
-    summary="All tickets for a district",
+    summary="All tickets for an engineer's district",
 )
-def get_tickets(district_id: str, conn=Depends(get_db)):
+def get_tickets(telegram_id: int, conn=Depends(get_db)):
     """
-    Returns all tickets whose `district_operation_do` matches `district_id`,
-    ordered by aging (highest first) then by creation date (newest first).
+    Resolve the engineer's district from the standalone Telegram assignment,
+    then return all tickets in that district ordered by aging and creation date.
 
     Note: `serviced=true` tickets are included for now.
     Once the system is stable, filter them out here.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT district_operation_do
+            FROM mba_sumbagut.telegram_district_role
+            WHERE telegram_id = %s AND role = 'engineer'
+        """, (telegram_id,))
+        assignments = cur.fetchall()
+        if not assignments:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Engineer Telegram ID {telegram_id} is not assigned to a district.",
+            )
+        districts = {row["district_operation_do"] for row in assignments}
+        if len(districts) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Engineer Telegram ID {telegram_id} has multiple district assignments.",
+            )
+        district_id = districts.pop()
+
         cur.execute("""
             SELECT
                 t.ticket_id,
@@ -329,17 +332,28 @@ def patch_ticket(ticket_id: int, body: RCAPatch, conn=Depends(get_db)):
                 detail=f"Ticket {ticket_id} already has an RCA submitted.",
             )
 
+        cur.execute("""
+            SELECT r.rca_id, d.rca_detail_id
+            FROM mba_sumbagut.rca r
+            JOIN mba_sumbagut.rca_detail d ON d.rca_id = r.rca_id
+            WHERE r.active AND d.active AND r.name = %s AND d.name = %s
+        """, (body.rca, body.rca_detail))
+        lookup = cur.fetchone()
+        if lookup is None:
+            raise HTTPException(status_code=422, detail="Invalid RCA or RCA detail.")
+        rca_id, rca_detail_id = lookup
+
         # ── Update ticket_rca ─────────────────────────────────────────────────
         try:
             cur.execute("""
                 UPDATE mba_sumbagut.ticket_rca
-                SET rca          = %s,
-                    rca_detail   = %s,
+                SET rca_id       = %s,
+                    rca_detail_id = %s,
                     submitted_at = now(),
                     end_day      = %s,
                     updated_at   = now()
                 WHERE ticket_id = %s
-            """, (body.rca.value, body.rca_detail, today, ticket_id))
+            """, (rca_id, rca_detail_id, today, ticket_id))
 
             # ── Insert ticket_service ─────────────────────────────────────────
             # start_day = today = ticket_rca.end_day

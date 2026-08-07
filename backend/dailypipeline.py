@@ -37,7 +37,7 @@ import sys
 from datetime import date, timedelta
 
 import psycopg2
-from dotenv import dotenv_values
+from settings import settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,13 +49,12 @@ log = logging.getLogger(__name__)
 #  Database connection 
 
 def get_connection() -> psycopg2.extensions.connection:
-    cfg = dotenv_values(".env")
     return psycopg2.connect(
-        host=cfg.get("host", "localhost"),
-        port=int(cfg.get("port", 5432)),
-        dbname=cfg.get("dbname", "postgres"),
-        user=cfg.get("user", "postgres"),
-        password=cfg.get("password", ""),
+        host=settings.database_host,
+        port=settings.database_port,
+        dbname=settings.database_name,
+        user=settings.database_user,
+        password=settings.database_password,
     )
 
 

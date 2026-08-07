@@ -22,7 +22,7 @@ import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import dotenv_values
+from settings import settings
 
 from dailypipeline import daily_pipeline
 
@@ -42,9 +42,12 @@ def _run() -> None:
 
 
 def main() -> None:
-    cfg  = dotenv_values(".env")
-    hour = int(cfg.get("PIPELINE_HOUR",   2))
-    minute = int(cfg.get("PIPELINE_MINUTE", 0))
+    if not settings.pipeline_enabled:
+        log.info("Scheduler disabled for NODE_ENV=%s", settings.node_env)
+        return
+
+    hour = settings.pipeline_hour
+    minute = settings.pipeline_minute
 
     scheduler = BlockingScheduler()
     scheduler.add_job(
