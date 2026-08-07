@@ -12,7 +12,7 @@ No separate scheduler process is needed.
 
 Endpoints
 ─────────
-  GET  /api/engineers/{district_id} — Engineer Telegram IDs assigned to district.
+  GET  /api/engineers              — All engineer Telegram IDs and districts.
   GET  /api/tickets/{telegram_id}  — Tickets for the engineer's assigned district.
   PATCH /api/tickets/{ticket_id}   — Submit RCA + RCA detail for a ticket.
                                      Also inserts the ticket_service row.
@@ -145,17 +145,51 @@ class TicketOut(BaseModel):
     site_id:     str
     identifiers: Identifiers
     aging:       int
-    status:      TicketStatus
+ 
+
+class TicketGroups(BaseModel):
+    need_service: list[TicketOut]
+    need_analysis: list[TicketOut]
 
 
 class TicketsResponse(BaseModel):
     district: str             # district_operation_do — bot uses this as the message header
-    tickets:  list[TicketOut]
+    tickets: TicketGroups
 
 
 class RCAPatch(BaseModel):
     rca:        str
     rca_detail: str
+
+
+def getsiteclass(site_id: str) -> str:
+    """Temporary site-class provider until the site reference query is finalized."""
+    return "bronze"
+
+
+def _aging_score(aging: int) -> int:
+    if aging < 4:
+        return 1
+    if aging <= 7:
+        return 2
+    if aging <= 14:
+        return 3
+    if aging <= 30:
+        return 4
+    return 5
+
+
+def _quantity_cell_score(active_count: int) -> int:
+    if active_count < 3:
+        return 1
+    if active_count <= 6:
+        return 3
+    return 5
+
+
+def _site_class_score(site_class: str) -> int:
+    scores = {"bronze": 1, "silver": 1, "gold": 2, "platinum": 2, "diamond": 3}
+    return scores.get(site_class.strip().lower(), 1)
 
 
 @app.get("/api/rca-options", summary="RCA categories and valid detail values")
@@ -178,25 +212,29 @@ def get_rca_options(conn=Depends(get_db)):
     return options
 
 
-# ── GET /api/engineers/{district_id} ─────────────────────────────────────────
+# ── GET /api/engineers ───────────────────────────────────────────────────────
 
-@app.get("/api/engineers/{district_id}", summary="List engineers assigned to a district")
-def get_engineers(district_id: str, conn=Depends(get_db)):
-    """Return Telegram IDs whose standalone assignment row marks them engineer."""
+@app.get("/api/engineers", summary="List all engineers and districts")
+def get_engineers(conn=Depends(get_db)):
+    """Return all engineer Telegram IDs with their assigned district."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT telegram_id
+            SELECT telegram_id, district_operation_do
             FROM mba_sumbagut.telegram_district_role
-            WHERE district_operation_do = %s
-              AND role = 'engineer'
-            ORDER BY telegram_id
-        """, (district_id,))
-        return {"engineers": [row[0] for row in cur.fetchall()]}
+            WHERE role = 'engineer'
+            ORDER BY district_operation_do, telegram_id
+        """)
+        return {
+            "engineers": [
+                {"telegram_id": row[0], "district_id": row[1]}
+                for row in cur.fetchall()
+            ]
+        }
 
 
 @app.get(
     "/api/mock/engineers/{telegram_id}/tickets",
-    response_model=TicketsResponse,
+    response_model=None,
     summary="Five mock tickets assigned to an engineer",
 )
 def get_mock_engineer_tickets(telegram_id: int):
@@ -246,28 +284,27 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
         district_id = districts.pop()
 
         cur.execute("""
-            SELECT
-                t.ticket_id,
-                t.ticket_type,
-                t.site_id,
-                t.enodeb_id,
-                t.cell_id,
-                t.lac,
-                t.ci,
-                t.aging,
-                t.district_operation_do,
-                (r.submitted_at IS NOT NULL)  AS rca_done,
-                (s.end_day      IS NOT NULL)  AS serviced_done
-            FROM mba_sumbagut.ticket t
-            LEFT JOIN mba_sumbagut.ticket_rca     r ON r.ticket_id = t.ticket_id
-            LEFT JOIN mba_sumbagut.ticket_service  s ON s.ticket_id = t.ticket_id
-            WHERE t.district_operation_do = %s
-            ORDER BY t.aging DESC, t.created_date DESC
+            WITH ticket_state AS (
+                SELECT t.ticket_id, t.ticket_type, t.site_id,
+                       t.enodeb_id, t.cell_id, t.lac, t.ci, t.aging,
+                       (r.submitted_at IS NOT NULL) AS rca_done,
+                       (s.end_day IS NOT NULL) AS serviced_done,
+                       COUNT(*) FILTER (
+                           WHERE r.end_day IS NULL OR s.end_day IS NULL
+                       ) OVER (PARTITION BY t.site_id) AS active_site_tickets
+                FROM mba_sumbagut.ticket t
+                LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+                LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+                WHERE t.district_operation_do = %s
+            )
+            SELECT * FROM ticket_state
+            WHERE NOT (rca_done AND serviced_done)
         """, (district_id,))
 
         rows = cur.fetchall()
 
-    tickets = []
+    need_service = []
+    need_analysis = []
     for row in rows:
         if row["ticket_type"] == "ZP":
             identifiers = Identifiers(
@@ -280,19 +317,36 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
                 ci=row["ci"],
             )
 
-        tickets.append(TicketOut(
+        ticket = TicketOut(
             ticket_id=row["ticket_id"],
             ticket_type=row["ticket_type"],
             site_id=row["site_id"],
             identifiers=identifiers,
             aging=row["aging"],
-            status=TicketStatus(
-                rca=bool(row["rca_done"]),
-                serviced=bool(row["serviced_done"]),
-            ),
-        ))
+        )
+        priority = (
+            0.4 * _aging_score(ticket.aging)
+            + 0.4 * _quantity_cell_score(row["active_site_tickets"])
+            + 0.2 * _site_class_score(getsiteclass(ticket.site_id))
+        )
+        if row["rca_done"] and not row["serviced_done"]:
+            need_service.append((priority, ticket))
+        elif not row["rca_done"]:
+            need_analysis.append((priority, ticket))
 
-    return TicketsResponse(district=district_id, tickets=tickets)
+    def priority_order(item):
+        priority, ticket = item
+        return (-priority, -ticket.aging, ticket.ticket_id)
+
+    need_service.sort(key=priority_order)
+    need_analysis.sort(key=priority_order)
+    return TicketsResponse(
+        district=district_id,
+        tickets=TicketGroups(
+            need_service=[ticket for _, ticket in need_service],
+            need_analysis=[ticket for _, ticket in need_analysis],
+        ),
+    )
 
 
 # ── PATCH /api/tickets/{ticket_id} ────────────────────────────────────────────

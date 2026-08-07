@@ -21,9 +21,9 @@ async def show_ticket_dashboard(update, context):
         return
 
     context.user_data["ticket_list"] = []
-    tickets = payload["tickets"]
-    need_servicing = [ticket for ticket in tickets if ticket["status"]["rca"] and not ticket["status"]["serviced"]]
-    need_analyzing = [ticket for ticket in tickets if not ticket["status"]["rca"]]
+    ticket_groups = payload["tickets"]
+    need_servicing = ticket_groups["need_service"]
+    need_analyzing = ticket_groups["need_analysis"]
 
     text = f"TICKET DASHBOARD — {payload['district']}\n\nNeed Servicing\n\n"
     if not need_servicing:
