@@ -172,3 +172,78 @@ Biarkan kedua terminal tetap berjalan selama pengujian.
 
 Jika hasil command menyatakan pesan gagal dikirim, pastikan ID Telegram itu
 benar, akun tersebut sudah mengirim `/start`, dan `TELEGRAM_BOT_TOKEN` valid.
+
+## 6. Mount staging dan production dengan Docker Compose
+
+Staging dan production memakai database PostgreSQL yang disediakan di luar
+Compose. Compose menjalankan backend; production juga menjalankan Telegram bot.
+
+### Staging
+
+Dari root repository, buat file konfigurasi lalu isi kredensial database staging:
+
+```powershell
+Copy-Item .\backend\.env.staging.example .\backend\.env.staging
+```
+
+Untuk pengujian manual, biarkan `ENABLE_PIPELINE=false` agar scheduler tidak
+mengubah data otomatis. Start staging dengan:
+
+```powershell
+docker compose -f .\docker-compose.staging.yml up --build -d
+```
+
+Periksa status dan log:
+
+```powershell
+docker compose -f .\docker-compose.staging.yml ps
+docker compose -f .\docker-compose.staging.yml logs -f backend
+```
+
+API tersedia di `http://127.0.0.1:8000` dan dokumentasinya di
+`http://127.0.0.1:8000/docs`. Hentikan staging dengan:
+
+```powershell
+docker compose -f .\docker-compose.staging.yml down
+```
+
+### Production
+
+Buat dan isi kedua file berikut pada host production. Jangan commit file ini
+atau membagikan token dan passwordnya:
+
+```powershell
+Copy-Item .\backend\.env.production.example .\backend\.env.production
+Copy-Item .\frontend\.env.production.example .\frontend\.env.production
+```
+
+Isi `backend/.env.production` dengan database production. Set
+`ENABLE_PIPELINE=true` hanya bila scheduler memang diinginkan; atur
+`PIPELINE_HOUR` dan `PIPELINE_MINUTE` sesuai timezone host/container. Pada
+`frontend/.env.production`, gunakan `API_BASE_URL=http://backend:8000/api`
+karena bot mengakses backend melalui jaringan Compose internal.
+
+Start production:
+
+```powershell
+docker compose -f .\docker-compose.production.yml up --build -d
+```
+
+Periksa status dan log:
+
+```powershell
+docker compose -f .\docker-compose.production.yml ps
+docker compose -f .\docker-compose.production.yml logs -f backend telegram-bot
+```
+
+Update image setelah perubahan kode dengan perintah yang sama (`up --build -d`).
+Untuk menghentikan layanan tanpa menghapus konfigurasi:
+
+```powershell
+docker compose -f .\docker-compose.production.yml down
+```
+
+Sebelum deployment, validasi Compose dengan `docker compose ... config` dan
+pastikan database dapat diakses dari host. Port `8000` hanya dibuka untuk API;
+reverse proxy, TLS, firewall, dan SSH access control tetap menjadi tanggung
+jawab infrastructure.
