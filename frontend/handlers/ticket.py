@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from telegram import ReplyKeyboardRemove
 
 from api_client import BackendAPIError, get_rca_options, get_tickets
@@ -5,11 +7,19 @@ from api_client import BackendAPIError, get_rca_options, get_tickets
 
 def _ticket_label(ticket):
     identifiers = ticket["identifiers"]
-    if ticket["ticket_type"] == "ZP":
-        location = f"eNodeB {identifiers['enodeb_id']} / Cell {identifiers['cell_id']}"
+    raw_date = ticket.get("created_date") or ticket.get("start_date")
+    if raw_date:
+        try:
+            start_date = datetime.fromisoformat(str(raw_date)).strftime("%d/%m/%y")
+        except ValueError:
+            start_date = str(raw_date)
     else:
-        location = f"LAC {identifiers['lac']} / CI {identifiers['ci']}"
-    return f"#{ticket['ticket_id']} ({ticket['ticket_type']}, {location})"
+        start_date = "-"
+    if ticket["ticket_type"] == "ZP":
+        location = f"{ticket['site_id']}_{identifiers['enodeb_id']}_{identifiers['cell_id']}"
+    else:
+        location = f"{ticket['site_id']}_{identifiers['lac']}_{identifiers['ci']}"
+    return f"#{ticket['ticket_id']} {ticket['ticket_type']} ({start_date})_{location}"
 
 
 def _site_class(ticket):
@@ -19,7 +29,8 @@ def _site_class(ticket):
 
 def _ticket_status(ticket):
     status = ticket.get("status", {})
-    return f"RCA: {str(bool(status.get('rca'))).lower()} | Serviced: {str(bool(status.get('serviced'))).lower()}"
+    serviced = "✅" if status.get("serviced") else "❌"
+    return f"Serviced: {serviced}"
 
 
 async def show_ticket_dashboard(update, context):
@@ -47,7 +58,12 @@ async def show_ticket_dashboard(update, context):
         need_servicing = ticket_groups["need_service"]
         need_analyzing = ticket_groups["need_analysis"]
 
-    text = f"TICKET DASHBOARD — {payload['district']}\n\nNeed Servicing\n\n"
+    text = (
+        f"TICKET DASHBOARD — {payload['district']}\n\n"
+        "Format: #ID TYPE (DD/MM/YY)_SITE_IDENTIFIER\n"
+        "Serviced: ✅ sudah selesai | ❌ belum selesai\n\n"
+        "Need Servicing\n\n"
+    )
     if not need_servicing:
         text += "Tidak ada tiket.\n\n"
     else:

@@ -142,6 +142,7 @@ class Identifiers(BaseModel):
 class TicketOut(BaseModel):
     ticket_id:   int
     ticket_type: str          # "ZP" or "ZT"
+    created_date: date
     site_id:     str
     identifiers: Identifiers
     aging:       int
@@ -287,7 +288,7 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
 
         cur.execute("""
             WITH ticket_state AS (
-                SELECT t.ticket_id, t.ticket_type, t.site_id,
+                SELECT t.ticket_id, t.ticket_type, t.created_date, t.site_id,
                        t.enodeb_id, t.cell_id, t.lac, t.ci, t.aging,
                        (r.submitted_at IS NOT NULL) AS rca_done,
                        (s.end_day IS NOT NULL) AS serviced_done,
@@ -322,6 +323,7 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
         ticket = TicketOut(
             ticket_id=row["ticket_id"],
             ticket_type=row["ticket_type"],
+            created_date=row["created_date"],
             site_id=row["site_id"],
             identifiers=identifiers,
             aging=row["aging"],
