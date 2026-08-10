@@ -30,7 +30,7 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
-from dailypipeline import daily_pipeline
+from dailypipeline import _tracking_record_rca, daily_pipeline
 from settings import settings
 
 log = logging.getLogger(__name__)
@@ -145,6 +145,7 @@ class TicketOut(BaseModel):
     site_id:     str
     identifiers: Identifiers
     aging:       int
+    status:      TicketStatus
     site_class:  str
  
 
@@ -324,6 +325,10 @@ def get_tickets(telegram_id: int, conn=Depends(get_db)):
             site_id=row["site_id"],
             identifiers=identifiers,
             aging=row["aging"],
+            status=TicketStatus(
+                rca=bool(row["rca_done"]),
+                serviced=bool(row["serviced_done"]),
+            ),
             site_class=getsiteclass(row["site_id"]),
         )
         priority = (
@@ -360,7 +365,8 @@ def patch_ticket(ticket_id: int, body: RCAPatch, conn=Depends(get_db)):
 
     On success:
     - ticket_rca.rca, rca_detail, submitted_at, end_day are set to today.
-    - A ticket_service row is inserted with start_day = today.
+    - RCA fields are updated; service tracking is maintained independently by
+      the pipeline and may already be solved.
 
     Returns 404 if the ticket doesn't exist.
     Returns 409 if RCA was already submitted for this ticket.
@@ -412,13 +418,7 @@ def patch_ticket(ticket_id: int, body: RCAPatch, conn=Depends(get_db)):
             """, (rca_id, rca_detail_id, today, ticket_id))
 
             # ── Insert ticket_service ─────────────────────────────────────────
-            # start_day = today = ticket_rca.end_day
-            cur.execute("""
-                INSERT INTO mba_sumbagut.ticket_service (ticket_id, start_day)
-                VALUES (%s, %s)
-                ON CONFLICT (ticket_id) DO NOTHING
-            """, (ticket_id, today))
-
+            _tracking_record_rca(cur, ticket_id)
             conn.commit()
 
         except psycopg2.errors.CheckViolation as e:

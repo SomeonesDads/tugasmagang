@@ -19,7 +19,7 @@ Two entry points
 Deduplication (both modes)
 ──────────────────────────
   We check the ticket table for an active open ticket, not the feed table.
-  "Active" = ticket exists AND (no ticket_service row yet OR end_day IS NULL).
+  "Active" = ticket exists AND ticket_service.end_day IS NULL.
 
   Scenarios:
     • No open ticket → create.
@@ -40,7 +40,7 @@ import psycopg2
 from settings import settings
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  [%(levelname)s]  %(message)s",
 )
 log = logging.getLogger(__name__)
@@ -128,6 +128,159 @@ def compute_aging(cur, table: str, filters: dict, today: date) -> int:
     return count
 
 
+def _tracking_add_ticket(cur, ticket_id: int) -> None:
+    """Increment total-ticket tracking for a newly created ticket."""
+    cur.execute("""
+        SELECT COALESCE(district_operation_do, 'UNASSIGNED'), site_id
+        FROM mba_sumbagut.ticket
+        WHERE ticket_id = %s
+    """, (ticket_id,))
+    row = cur.fetchone()
+    if row is None:
+        return
+    district, site_id = row
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_summary
+            (district, count_problems, solved_rca, solved_service, updated_at)
+        VALUES (%s, 1, 0, 0, now())
+        ON CONFLICT (district) DO UPDATE
+        SET count_problems = tracking_summary.count_problems + 1,
+            updated_at = now()
+    """, (district,))
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_summary_site
+            (site_id, count_problems, solved_rca, solved_service, updated_at)
+        VALUES (%s, 1, 0, 0, now())
+        ON CONFLICT (site_id) DO UPDATE
+        SET count_problems = tracking_summary_site.count_problems + 1,
+            updated_at = now()
+    """, (site_id,))
+
+
+def _tracking_record_service(cur, ticket_id: int) -> None:
+    """Record one newly closed service phase in tracking aggregates."""
+    cur.execute("""
+        SELECT COALESCE(t.district_operation_do, 'UNASSIGNED'), t.site_id,
+               r.rca_id, s.end_day - s.start_day AS service_days
+        FROM mba_sumbagut.ticket t
+        JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+        WHERE t.ticket_id = %s AND s.end_day IS NOT NULL
+    """, (ticket_id,))
+    row = cur.fetchone()
+    if row is None:
+        return
+    district, site_id, rca_id, service_days = row
+
+    for table, key, value in (
+        ("tracking_summary", "district", district),
+        ("tracking_summary_site", "site_id", site_id),
+    ):
+        cur.execute(f"""
+            UPDATE mba_sumbagut.{table}
+            SET solved_service = solved_service + 1,
+                solved_service_avg_time =
+                    (COALESCE(solved_service_avg_time, 0) * solved_service + %s)
+                    / (solved_service + 1),
+                updated_at = now()
+            WHERE {key} = %s
+        """, (service_days, value))
+
+    if rca_id is not None:
+        cur.execute("""
+            UPDATE mba_sumbagut.tracking_detail
+            SET solved_service = solved_service + 1,
+                solved_service_avg_time =
+                    (COALESCE(solved_service_avg_time, 0) * solved_service + %s)
+                    / (solved_service + 1),
+                updated_at = now()
+            WHERE district = %s AND rca_id = %s
+        """, (service_days, district, rca_id))
+        cur.execute("""
+            UPDATE mba_sumbagut.tracking_detail_site
+            SET solved_service = solved_service + 1,
+                solved_service_avg_time =
+                    (COALESCE(solved_service_avg_time, 0) * solved_service + %s)
+                    / (solved_service + 1),
+                updated_at = now()
+            WHERE site_id = %s AND rca_id = %s
+        """, (service_days, site_id, rca_id))
+
+
+def _tracking_record_rca(cur, ticket_id: int) -> None:
+    """Record one newly submitted RCA in tracking aggregates."""
+    cur.execute("""
+        SELECT COALESCE(t.district_operation_do, 'UNASSIGNED'), t.site_id,
+               t.created_date, r.end_day, r.rca_id,
+               s.end_day IS NOT NULL, s.end_day - s.start_day
+        FROM mba_sumbagut.ticket t
+        JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        WHERE t.ticket_id = %s AND r.submitted_at IS NOT NULL
+    """, (ticket_id,))
+    row = cur.fetchone()
+    if row is None:
+        return
+    district, site_id, created_date, rca_end_day, rca_id, serviced, service_days = row
+    analysis_days = (rca_end_day - created_date).days
+
+    for table, key, value in (
+        ("tracking_summary", "district", district),
+        ("tracking_summary_site", "site_id", site_id),
+    ):
+        cur.execute(f"""
+            UPDATE mba_sumbagut.{table}
+            SET solved_rca = solved_rca + 1,
+                solved_rca_avg_time =
+                    (COALESCE(solved_rca_avg_time, 0) * solved_rca + %s)
+                    / (solved_rca + 1),
+                updated_at = now()
+            WHERE {key} = %s
+        """, (analysis_days, value))
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_detail
+            (district, rca_id, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        VALUES (%s, %s, 1, 1, %s, %s, %s, now())
+        ON CONFLICT (district, rca_id) DO UPDATE
+        SET count_problems = tracking_detail.count_problems + 1,
+            solved_rca = tracking_detail.solved_rca + 1,
+            solved_service = tracking_detail.solved_service + EXCLUDED.solved_service,
+            solved_rca_avg_time =
+                (COALESCE(tracking_detail.solved_rca_avg_time, 0) * tracking_detail.solved_rca + %s)
+                / (tracking_detail.solved_rca + 1),
+            solved_service_avg_time = CASE WHEN EXCLUDED.solved_service = 1 THEN
+                (COALESCE(tracking_detail.solved_service_avg_time, 0) * tracking_detail.solved_service + %s)
+                / (tracking_detail.solved_service + 1)
+                ELSE tracking_detail.solved_service_avg_time END,
+            updated_at = now()
+    """, (district, rca_id, int(serviced), analysis_days,
+           service_days if serviced else None, analysis_days,
+           service_days if serviced else 0))
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_detail_site
+            (site_id, rca_id, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        VALUES (%s, %s, 1, 1, %s, %s, %s, now())
+        ON CONFLICT (site_id, rca_id) DO UPDATE
+        SET count_problems = tracking_detail_site.count_problems + 1,
+            solved_rca = tracking_detail_site.solved_rca + 1,
+            solved_service = tracking_detail_site.solved_service + EXCLUDED.solved_service,
+            solved_rca_avg_time =
+                (COALESCE(tracking_detail_site.solved_rca_avg_time, 0) * tracking_detail_site.solved_rca + %s)
+                / (tracking_detail_site.solved_rca + 1),
+            solved_service_avg_time = CASE WHEN EXCLUDED.solved_service = 1 THEN
+                (COALESCE(tracking_detail_site.solved_service_avg_time, 0) * tracking_detail_site.solved_service + %s)
+                / (tracking_detail_site.solved_service + 1)
+                ELSE tracking_detail_site.solved_service_avg_time END,
+            updated_at = now()
+    """, (site_id, rca_id, int(serviced), analysis_days,
+           service_days if serviced else None, analysis_days,
+           service_days if serviced else 0))
+
+
 # ── Shared: ticket + ticket_rca insert ────────────────────────────────────────
 
 def _insert_ticket_and_rca(cur, ticket_params: tuple, start_day: date) -> int | None:
@@ -155,7 +308,27 @@ def _insert_ticket_and_rca(cur, ticket_params: tuple, start_day: date) -> int | 
         VALUES (%s, %s)
     """, (ticket_id, start_day))
 
+    # Service tracking is independent from RCA. A cell can clear from the
+    # daily feed before an engineer submits the root cause analysis.
+    cur.execute("""
+        INSERT INTO mba_sumbagut.ticket_service (ticket_id, start_day)
+        VALUES (%s, %s)
+    """, (ticket_id, start_day))
+    _tracking_add_ticket(cur, ticket_id)
+
     return ticket_id
+
+
+def _ensure_service_rows(cur) -> None:
+    """Backfill service tracking for tickets created before this lifecycle fix."""
+    cur.execute("""
+        INSERT INTO mba_sumbagut.ticket_service (ticket_id, start_day)
+        SELECT t.ticket_id, t.created_date
+        FROM mba_sumbagut.ticket t
+        LEFT JOIN mba_sumbagut.ticket_service ts ON ts.ticket_id = t.ticket_id
+        WHERE ts.ticket_id IS NULL
+        ON CONFLICT (ticket_id) DO NOTHING
+    """)
 
 
 # ── Shared: dedup query — cells in today's feed with NO active open ticket ────
@@ -213,7 +386,6 @@ def _seed_zp_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZP_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-
     for enodeb_id, cell_id, site_id in rows:
         try:
             district = resolve_district(cur, site_id)
@@ -231,10 +403,10 @@ def _seed_zp_pass(cur, today: date) -> tuple[int, int]:
                           f"site={site_id}  aging={aging}")
             else:
                 skipped += 1
+            
         except Exception:
             log.exception(f"  [SEED/ZP] Failed  enodeb={enodeb_id}  cell={cell_id}  site={site_id}")
             raise
-
     log.info(f"[SEED/ZP] Done  created={created}  skipped={skipped}")
     return created, skipped
 
@@ -247,7 +419,6 @@ def _seed_zt_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZT_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-
     for lac, ci, site_id in rows:
         try:
             district = resolve_district(cur, site_id)
@@ -267,7 +438,6 @@ def _seed_zt_pass(cur, today: date) -> tuple[int, int]:
         except Exception:
             log.exception(f"  [SEED/ZT] Failed  lac={lac}  ci={ci}  site={site_id}")
             raise
-
     log.info(f"[SEED/ZT] Done  created={created}  skipped={skipped}")
     return created, skipped
 
@@ -285,28 +455,35 @@ def seed_pipeline() -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                zp_date = get_feed_date(cur, "sri_zp_daily")
-                zt_date = get_feed_date(cur, "sri_zt_daily")
+                cur.execute('SELECT DISTINCT "date" FROM mba_sumbagut.sri_zp_daily ORDER BY "date"')
+                zp_dates = {row[0] for row in cur.fetchall()}
+                cur.execute('SELECT DISTINCT "date" FROM mba_sumbagut.sri_zt_daily ORDER BY "date"')
+                zt_dates = {row[0] for row in cur.fetchall()}
+                feed_dates = sorted(zp_dates | zt_dates)
 
-                if zp_date is None and zt_date is None:
+                if not feed_dates:
                     log.warning("No data in either feed table. Nothing to seed.")
                     return
 
-                today = max(d for d in [zp_date, zt_date] if d is not None)
-                log.info(f"Seeding from feed date: {today}")
-
+                _ensure_service_rows(cur)
                 zp_created = zp_skipped = 0
                 zt_created = zt_skipped = 0
+                total_closed = 0
 
-                if zp_date == today:
-                    zp_created, zp_skipped = _seed_zp_pass(cur, today)
-                else:
-                    log.warning(f"[SEED/ZP] Feed date {zp_date} ≠ {today} — skipping")
-
-                if zt_date == today:
-                    zt_created, zt_skipped = _seed_zt_pass(cur, today)
-                else:
-                    log.warning(f"[SEED/ZT] Feed date {zt_date} ≠ {today} — skipping")
+                # Replay the complete feed history. Closing before inserting
+                # today's cells allows a cell that returned after a gap to get
+                # a new ticket instead of being blocked by its old one.
+                for feed_date in feed_dates:
+                    closed = _run_close_pass(cur, feed_date)
+                    total_closed += closed
+                    if feed_date in zp_dates:
+                        created, skipped = _seed_zp_pass(cur, feed_date)
+                        zp_created += created
+                        zp_skipped += skipped
+                    if feed_date in zt_dates:
+                        created, skipped = _seed_zt_pass(cur, feed_date)
+                        zt_created += created
+                        zt_skipped += skipped
 
                 refresh_tracking(cur)
 
@@ -314,7 +491,8 @@ def seed_pipeline() -> None:
         log.info(
             f"SEED complete\n"
             f"  ZP : {zp_created:>4} created  {zp_skipped:>4} skipped\n"
-            f"  ZT : {zt_created:>4} created  {zt_skipped:>4} skipped"
+            f"  ZT : {zt_created:>4} created  {zt_skipped:>4} skipped\n"
+            f"  Service tickets closed : {total_closed}"
         )
         log.info("=" * 60)
 
@@ -342,7 +520,6 @@ def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZP_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-
     for enodeb_id, cell_id, site_id in rows:
         try:
             district = resolve_district(cur, site_id)
@@ -373,7 +550,6 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZT_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-
     for lac, ci, site_id in rows:
         try:
             district = resolve_district(cur, site_id)
@@ -426,6 +602,7 @@ def _run_close_pass(cur, today: date) -> int:
                 WHERE ticket_id = %s
             """, (today, ticket_id))
             closed += 1
+            _tracking_record_service(cur, ticket_id)
             log.debug(f"  [CLOSE/ZP] #{ticket_id} closed")
 
     # ── Close ZT service tickets ─────────────────────────────────────────────
@@ -452,10 +629,95 @@ def _run_close_pass(cur, today: date) -> int:
                 WHERE ticket_id = %s
             """, (today, ticket_id))
             closed += 1
+            _tracking_record_service(cur, ticket_id)
             log.debug(f"  [CLOSE/ZT] #{ticket_id} closed")
 
     log.info(f"[CLOSE] Done  closed={closed}")
     return closed
+
+
+def refresh_tracking(cur) -> None:
+    """Rebuild manager tracking aggregates from ticket lifecycle tables."""
+    log.info("[TRACKING] Refreshing tracking aggregates")
+
+    # These tables are derived data. Rebuilding them removes stale groups after
+    # historical backfills and keeps all four manager views consistent.
+    cur.execute("DELETE FROM mba_sumbagut.tracking_detail_site")
+    cur.execute("DELETE FROM mba_sumbagut.tracking_detail")
+    cur.execute("DELETE FROM mba_sumbagut.tracking_summary_site")
+    cur.execute("DELETE FROM mba_sumbagut.tracking_summary")
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_summary
+            (district, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        SELECT COALESCE(t.district_operation_do, 'UNASSIGNED'), COUNT(*),
+               COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL),
+               COUNT(*) FILTER (WHERE s.end_day IS NOT NULL),
+               AVG((r.end_day - t.created_date)::numeric)
+                   FILTER (WHERE r.end_day IS NOT NULL),
+               AVG((s.end_day - s.start_day)::numeric)
+                   FILTER (WHERE s.end_day IS NOT NULL), now()
+        FROM mba_sumbagut.ticket t
+        LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        GROUP BY COALESCE(t.district_operation_do, 'UNASSIGNED')
+    """)
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_detail
+            (district, rca_id, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        SELECT COALESCE(t.district_operation_do, 'UNASSIGNED'), r.rca_id,
+               COUNT(*), COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL),
+               COUNT(*) FILTER (WHERE s.end_day IS NOT NULL),
+               AVG((r.end_day - t.created_date)::numeric)
+                   FILTER (WHERE r.end_day IS NOT NULL),
+               AVG((s.end_day - s.start_day)::numeric)
+                   FILTER (WHERE s.end_day IS NOT NULL), now()
+        FROM mba_sumbagut.ticket t
+        JOIN mba_sumbagut.ticket_rca r
+          ON r.ticket_id = t.ticket_id AND r.rca_id IS NOT NULL
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        GROUP BY COALESCE(t.district_operation_do, 'UNASSIGNED'), r.rca_id
+    """)
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_summary_site
+            (site_id, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        SELECT t.site_id, COUNT(*),
+               COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL),
+               COUNT(*) FILTER (WHERE s.end_day IS NOT NULL),
+               AVG((r.end_day - t.created_date)::numeric)
+                   FILTER (WHERE r.end_day IS NOT NULL),
+               AVG((s.end_day - s.start_day)::numeric)
+                   FILTER (WHERE s.end_day IS NOT NULL), now()
+        FROM mba_sumbagut.ticket t
+        LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        GROUP BY t.site_id
+    """)
+
+    cur.execute("""
+        INSERT INTO mba_sumbagut.tracking_detail_site
+            (site_id, rca_id, count_problems, solved_rca, solved_service,
+             solved_rca_avg_time, solved_service_avg_time, updated_at)
+        SELECT t.site_id, r.rca_id, COUNT(*),
+               COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL),
+               COUNT(*) FILTER (WHERE s.end_day IS NOT NULL),
+               AVG((r.end_day - t.created_date)::numeric)
+                   FILTER (WHERE r.end_day IS NOT NULL),
+               AVG((s.end_day - s.start_day)::numeric)
+                   FILTER (WHERE s.end_day IS NOT NULL), now()
+        FROM mba_sumbagut.ticket t
+        JOIN mba_sumbagut.ticket_rca r
+          ON r.ticket_id = t.ticket_id AND r.rca_id IS NOT NULL
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        GROUP BY t.site_id, r.rca_id
+    """)
+
+    log.info("[TRACKING] Refresh complete")
 
 
 def daily_pipeline() -> None:
@@ -479,6 +741,10 @@ def daily_pipeline() -> None:
 
                 today = max(d for d in [zp_date, zt_date] if d is not None)
                 log.info(f"Feed date: {today}")
+                _ensure_service_rows(cur)
+                # Close yesterday's service state before creating today's
+                # tickets, so a cell returning after a gap gets a new ticket.
+                closed = _run_close_pass(cur, today)
 
                 zp_created = zp_skipped = 0
                 zt_created = zt_skipped = 0
@@ -492,9 +758,6 @@ def daily_pipeline() -> None:
                     zt_created, zt_skipped = _daily_zt_pass(cur, today)
                 else:
                     log.warning(f"[DAILY/ZT] Feed date {zt_date} ≠ {today} — skipping")
-
-                closed = _run_close_pass(cur, today)
-                refresh_tracking(cur)
 
         log.info("=" * 60)
         log.info(

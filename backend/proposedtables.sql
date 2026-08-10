@@ -1,7 +1,7 @@
 -- Tables:
 --   ticket                 base entity (ZP uses enodeb_id+cell_id, ZT uses lac+ci)
 --   ticket_rca             IS-A child; created immediately, filled by engineers
---   ticket_service         IS-A child; inserted once ticket_rca.end_day is set
+--   ticket_service         IS-A child; inserted when the ticket is created
 --
 --   Tracking (refreshed daily by pipeline):
 --      tracking_summary       district-level aggregate metrics
@@ -177,8 +177,9 @@ CREATE INDEX idx_ticket_rca_pending_svc ON mba_sumbagut.ticket_rca (end_day)
 
 --  mba_sumbagut.ticket_service 
 --
--- IS-A child of ticket. Inserted by backend when ticket_rca.end_day is set.
--- start_day = ticket_rca.end_day.
+-- IS-A child of ticket. Inserted when the ticket is created, independently of
+-- RCA. Service can be solved before the engineer submits the RCA.
+-- start_day = ticket.created_date.
 -- end_day is set by the daily pipeline when the problematic cell no longer
 -- appears in sri_zp_daily / sri_zt_daily for that day.
 -- Minimum service duration is 1 day (feed is daily, so resolution can only
