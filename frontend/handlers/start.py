@@ -1,14 +1,9 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from keyboards.menu import main_menu
+from handlers.ticket import show_ticket_dashboard
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "Selamat datang di Bot Monitoring RCA.\n\n"
-        "Silakan pilih menu di bawah ini.\n\n"
-        "Gunakan /notify_engineers untuk mengirim penugasan mock ke engineer.",
-        reply_markup=main_menu()
-    )
+    """Start directly on the current ticket dashboard."""
+    await show_ticket_dashboard(update, context)

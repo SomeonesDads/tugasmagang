@@ -10,7 +10,7 @@ async def input_rca(update, context):
         return
 
     try:
-        options = await get_rca_options()
+        options = context.user_data.get("rca_options") or await get_rca_options()
     except BackendAPIError as exc:
         await update.message.reply_text(f"❌ {exc}")
         return
@@ -54,7 +54,15 @@ async def input_rca_detail(update, context):
         return
 
     context.user_data["waiting_detail"] = False
+    context.user_data.pop("ticket", None)
+    context.user_data.pop("rca", None)
+    context.user_data.pop("rca_options", None)
+
     await update.message.reply_text(
         "✅ RCA berhasil disimpan.\n\n"
         f"Tiket: #{ticket['ticket_id']}\nRCA: {rca}\nRCA Detail: {rca_detail}"
     )
+
+    # Refresh immediately so the engineer sees the latest ticket queue.
+    from handlers.ticket import show_ticket_dashboard
+    await show_ticket_dashboard(update, context)
