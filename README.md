@@ -33,6 +33,18 @@ $env:TELEGRAM_BOT_TOKEN = "your-token"
 docker compose -f .\docker-compose.local.yml --profile bot up --build
 ```
 
+To populate the manager recap screens with hundreds-scale district and site
+metrics without creating ticket rows, run the aggregate-only demo seeder from
+the backend directory:
+
+```powershell
+Set-Location .\backend
+python seed_demo_tracking.py --district "TO RANTAU PRAPAT" --sites RNT001,RNT002,RNT003,RNT004,RNT005
+```
+
+It replaces only the selected district's rows in `tracking_summary`,
+`tracking_detail`, `tracking_summary_site`, and `tracking_detail_site`.
+
 ### Staging
 
 Copy `backend/.env.staging.example` to `backend/.env.staging`, fill in the
