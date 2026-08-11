@@ -99,7 +99,7 @@ CREATE TABLE mba_sumbagut.telegram_district_role (
     CONSTRAINT telegram_district_role_pkey
         PRIMARY KEY (telegram_id, district_operation_do, role),
     CONSTRAINT chk_telegram_district_role_role
-        CHECK (role IN ('engineer', 'manager'))
+        CHECK (role IN ('engineer', 'manager', 'admin'))
 );
 
 CREATE INDEX idx_telegram_district_role_district
