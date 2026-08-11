@@ -56,6 +56,10 @@ def load_settings() -> Settings:
             os.getenv("password", os.getenv("pass", "")),
         )
 
+    db_host = db_host.strip()
+    db_name = db_name.strip()
+    db_user = db_user.strip()
+
     return Settings(
         node_env=node_env,
         database_host=db_host,

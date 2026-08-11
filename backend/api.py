@@ -163,7 +163,9 @@ class TicketsResponse(BaseModel):
 class IdentityResponse(BaseModel):
     telegram_id: int
     role: str
-    district: str
+    # Admins choose the district for each simulated session, so they do not
+    # have a single effective district when the bot first identifies them.
+    district: Optional[str] = None
 
 
 class TrackingSummaryOut(BaseModel):
@@ -229,11 +231,6 @@ class SiteDetailsResponse(BaseModel):
 class RCAPatch(BaseModel):
     rca:        str
     rca_detail: str
-
-
-def getsiteclass(site_id: str) -> str:
-    """Temporary site-class provider until the site reference query is finalized."""
-    return "bronze"
 
 
 def _aging_score(aging: int) -> int:
@@ -306,8 +303,6 @@ def _resolve_assignment(
         row["role"] if hasattr(row, "keys") else row[1]
         for row in assignments
     }
-    if len(districts) > 1:
-        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
     if len(roles) > 1:
         raise HTTPException(status_code=409, detail="Telegram user has multiple roles.")
     actual_role = roles.pop()
@@ -315,6 +310,8 @@ def _resolve_assignment(
         if role not in {"manager", "engineer"} or not district_override:
             raise HTTPException(status_code=400, detail="Admin must select a role and district.")
         return district_override, role
+    if len(districts) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
     if role is not None and actual_role != role:
         raise HTTPException(status_code=403, detail=f"Telegram user is not assigned as {role}.")
     if district_override is not None and district_override not in districts:
@@ -325,7 +322,37 @@ def _resolve_assignment(
 @app.get("/api/identity/{telegram_id}", response_model=IdentityResponse, summary="Resolve Telegram role and district")
 def get_identity(telegram_id: int, conn=Depends(get_db)):
     with conn.cursor() as cur:
-        district, role = _resolve_assignment(cur, telegram_id)
+        cur.execute("""
+            SELECT district_operation_do, role
+            FROM mba_sumbagut.telegram_district_role
+            WHERE telegram_id = %s
+        """, (telegram_id,))
+        assignments = cur.fetchall()
+
+    if not assignments:
+        raise HTTPException(status_code=404, detail="Telegram user is not assigned.")
+
+    districts = {
+        row["district_operation_do"] if hasattr(row, "keys") else row[0]
+        for row in assignments
+    }
+    roles = {
+        row["role"] if hasattr(row, "keys") else row[1]
+        for row in assignments
+    }
+    if len(roles) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple roles.")
+
+    role = roles.pop()
+    # An admin deliberately has no active district until it selects one in the
+    # Telegram flow.  The selected role/district is then supplied to the
+    # protected data endpoints as an override.
+    if role == "admin":
+        return IdentityResponse(telegram_id=telegram_id, role=role)
+
+    if len(districts) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
+    district = districts.pop()
     return IdentityResponse(telegram_id=telegram_id, role=role, district=district)
 
 
@@ -521,12 +548,16 @@ def get_tickets(
             WITH ticket_state AS (
                 SELECT t.ticket_id, t.ticket_type, t.created_date, t.site_id,
                        t.enodeb_id, t.cell_id, t.lac, t.ci, t.aging,
+                       COALESCE(mapping.class, 'unknown') AS site_class,
                        (r.submitted_at IS NOT NULL) AS rca_done,
                        (s.end_day IS NOT NULL) AS serviced_done,
                        COUNT(*) FILTER (
                            WHERE r.end_day IS NULL OR s.end_day IS NULL
                        ) OVER (PARTITION BY t.site_id) AS active_site_tickets
                 FROM mba_sumbagut.ticket t
+                LEFT JOIN sumatera.mapping_sysinfo_geohash mapping
+                  ON mapping.site_id = t.site_id
+                 AND mapping.region = 'SUMBAGUT'
                 LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
                 LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
                 WHERE t.district_operation_do = %s
@@ -562,12 +593,12 @@ def get_tickets(
                 rca=bool(row["rca_done"]),
                 serviced=bool(row["serviced_done"]),
             ),
-            site_class=getsiteclass(row["site_id"]),
+            site_class=row["site_class"],
         )
         priority = (
             0.4 * _aging_score(ticket.aging)
             + 0.4 * _quantity_cell_score(row["active_site_tickets"])
-            + 0.2 * _site_class_score(getsiteclass(ticket.site_id))
+            + 0.2 * _site_class_score(ticket.site_class)
         )
         if row["rca_done"] and not row["serviced_done"]:
             need_service.append((priority, ticket))

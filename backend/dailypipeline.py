@@ -33,6 +33,7 @@ Usage
 """
 
 import logging
+import os
 import sys
 from datetime import date, timedelta
 
@@ -40,7 +41,7 @@ import psycopg2
 from settings import settings
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=getattr(logging, os.getenv("PIPELINE_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s  [%(levelname)s]  %(message)s",
 )
 log = logging.getLogger(__name__)
@@ -283,7 +284,7 @@ def _tracking_record_rca(cur, ticket_id: int) -> None:
 
 # ── Shared: ticket + ticket_rca insert ────────────────────────────────────────
 
-def _insert_ticket_and_rca(cur, ticket_params: tuple, start_day: date) -> int | None:
+def _insert_ticket_and_rca(cur, ticket_params: tuple, start_day: date, *, update_tracking: bool = True) -> int | None:
     """
     Insert one ticket row and its corresponding ticket_rca skeleton.
     Returns the new ticket_id, or None if a conflict occurred (already exists).
@@ -314,7 +315,8 @@ def _insert_ticket_and_rca(cur, ticket_params: tuple, start_day: date) -> int | 
         INSERT INTO mba_sumbagut.ticket_service (ticket_id, start_day)
         VALUES (%s, %s)
     """, (ticket_id, start_day))
-    _tracking_add_ticket(cur, ticket_id)
+    if update_tracking:
+        _tracking_add_ticket(cur, ticket_id)
 
     return ticket_id
 
@@ -377,7 +379,7 @@ _ZT_NEW_CELLS_SQL = """
 # computes accurate historical aging by walking back consecutive dates.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _seed_zp_pass(cur, today: date) -> tuple[int, int]:
+def _seed_zp_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[int, int]:
     """
     Seed pass for ZP: create tickets for all cells in today's feed
     that have no active open ticket, with aging computed from feed history.
@@ -396,7 +398,7 @@ def _seed_zp_pass(cur, today: date) -> tuple[int, int]:
             )
             params = ("ZP", enodeb_id, cell_id, None, None,
                       site_id, district, today, aging)
-            tid = _insert_ticket_and_rca(cur, params, today)
+            tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
             if tid:
                 created += 1
                 log.debug(f"  [SEED/ZP] #{tid}  enodeb={enodeb_id}  cell={cell_id}  "
@@ -411,7 +413,7 @@ def _seed_zp_pass(cur, today: date) -> tuple[int, int]:
     return created, skipped
 
 
-def _seed_zt_pass(cur, today: date) -> tuple[int, int]:
+def _seed_zt_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[int, int]:
     """
     Seed pass for ZT: same logic using lac/ci and sri_zt_daily history.
     """
@@ -429,7 +431,7 @@ def _seed_zt_pass(cur, today: date) -> tuple[int, int]:
             )
             params = ("ZT", None, None, lac, ci,
                       site_id, district, today, aging)
-            tid = _insert_ticket_and_rca(cur, params, today)
+            tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
             if tid:
                 created += 1
                 log.debug(f"  [SEED/ZT] #{tid}  lac={lac}  ci={ci}  site={site_id}  aging={aging}")
@@ -455,9 +457,19 @@ def seed_pipeline() -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute('SELECT DISTINCT "date" FROM mba_sumbagut.sri_zp_daily ORDER BY "date"')
+                cur.execute(
+                    'SELECT DISTINCT "date" '
+                    'FROM mba_sumbagut.sri_zp_daily '
+                    'WHERE "date" IS NOT NULL '
+                    'ORDER BY "date"'
+                )
                 zp_dates = {row[0] for row in cur.fetchall()}
-                cur.execute('SELECT DISTINCT "date" FROM mba_sumbagut.sri_zt_daily ORDER BY "date"')
+                cur.execute(
+                    'SELECT DISTINCT "date" '
+                    'FROM mba_sumbagut.sri_zt_daily '
+                    'WHERE "date" IS NOT NULL '
+                    'ORDER BY "date"'
+                )
                 zt_dates = {row[0] for row in cur.fetchall()}
                 feed_dates = sorted(zp_dates | zt_dates)
 
@@ -474,14 +486,14 @@ def seed_pipeline() -> None:
                 # today's cells allows a cell that returned after a gap to get
                 # a new ticket instead of being blocked by its old one.
                 for feed_date in feed_dates:
-                    closed = _run_close_pass(cur, feed_date)
+                    closed = _run_close_pass(cur, feed_date, update_tracking=False)
                     total_closed += closed
                     if feed_date in zp_dates:
-                        created, skipped = _seed_zp_pass(cur, feed_date)
+                        created, skipped = _seed_zp_pass(cur, feed_date, update_tracking=False)
                         zp_created += created
                         zp_skipped += skipped
                     if feed_date in zt_dates:
-                        created, skipped = _seed_zt_pass(cur, feed_date)
+                        created, skipped = _seed_zt_pass(cur, feed_date, update_tracking=False)
                         zt_created += created
                         zt_skipped += skipped
 
@@ -569,71 +581,53 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     return created, skipped
 
 
-def _run_close_pass(cur, today: date) -> int:
+def _run_close_pass(cur, today: date, *, update_tracking: bool = True) -> int:
     """
     Close ticket_service rows where the problematic cell no longer appears
     in today's feed.  Minimum service duration = 1 day (feed is daily).
     Returns count of tickets closed.
     """
     log.info("[CLOSE] Service ticket close pass")
-    closed = 0
+    closed_ids = []
 
     # ── Close ZP service tickets ─────────────────────────────────────────────
     cur.execute("""
-        SELECT ts.ticket_id, t.enodeb_id, t.cell_id, t.site_id
-        FROM mba_sumbagut.ticket_service ts
-        JOIN mba_sumbagut.ticket t ON t.ticket_id = ts.ticket_id
-        WHERE ts.end_day   IS NULL
-          AND t.ticket_type = 'ZP'
-    """)
-    for ticket_id, enodeb_id, cell_id, site_id in cur.fetchall():
-        cur.execute("""
-            SELECT 1 FROM mba_sumbagut.sri_zp_daily
-            WHERE "date"    = %s
-              AND enodeb_id = %s
-              AND cell_id   = %s
-              AND site_id   = %s
-            LIMIT 1
-        """, (today, enodeb_id, cell_id, site_id))
-        if cur.fetchone() is None:
-            cur.execute("""
-                UPDATE mba_sumbagut.ticket_service
-                SET end_day = %s, updated_at = now()
-                WHERE ticket_id = %s
-            """, (today, ticket_id))
-            closed += 1
-            _tracking_record_service(cur, ticket_id)
-            log.debug(f"  [CLOSE/ZP] #{ticket_id} closed")
+        UPDATE mba_sumbagut.ticket_service ts
+        SET end_day = %s, updated_at = now()
+        FROM mba_sumbagut.ticket t
+        WHERE t.ticket_id = ts.ticket_id
+          AND ts.end_day IS NULL AND t.ticket_type = 'ZP'
+          AND NOT EXISTS (
+              SELECT 1 FROM mba_sumbagut.sri_zp_daily d
+              WHERE d."date" = %s AND d.enodeb_id = t.enodeb_id
+                AND d.cell_id = t.cell_id AND d.site_id = t.site_id
+          )
+        RETURNING ts.ticket_id
+    """, (today, today))
+    closed_ids.extend(row[0] for row in cur.fetchall())
 
     # ── Close ZT service tickets ─────────────────────────────────────────────
     cur.execute("""
-        SELECT ts.ticket_id, t.lac, t.ci, t.site_id
-        FROM mba_sumbagut.ticket_service ts
-        JOIN mba_sumbagut.ticket t ON t.ticket_id = ts.ticket_id
-        WHERE ts.end_day   IS NULL
-          AND t.ticket_type = 'ZT'
-    """)
-    for ticket_id, lac, ci, site_id in cur.fetchall():
-        cur.execute("""
-            SELECT 1 FROM mba_sumbagut.sri_zt_daily
-            WHERE "date"  = %s
-              AND lac      = %s
-              AND ci       = %s
-              AND site_id  = %s
-            LIMIT 1
-        """, (today, lac, ci, site_id))
-        if cur.fetchone() is None:
-            cur.execute("""
-                UPDATE mba_sumbagut.ticket_service
-                SET end_day = %s, updated_at = now()
-                WHERE ticket_id = %s
-            """, (today, ticket_id))
-            closed += 1
-            _tracking_record_service(cur, ticket_id)
-            log.debug(f"  [CLOSE/ZT] #{ticket_id} closed")
+        UPDATE mba_sumbagut.ticket_service ts
+        SET end_day = %s, updated_at = now()
+        FROM mba_sumbagut.ticket t
+        WHERE t.ticket_id = ts.ticket_id
+          AND ts.end_day IS NULL AND t.ticket_type = 'ZT'
+          AND NOT EXISTS (
+              SELECT 1 FROM mba_sumbagut.sri_zt_daily d
+              WHERE d."date" = %s AND d.lac = t.lac
+                AND d.ci = t.ci AND d.site_id = t.site_id
+          )
+        RETURNING ts.ticket_id
+    """, (today, today))
+    closed_ids.extend(row[0] for row in cur.fetchall())
 
-    log.info(f"[CLOSE] Done  closed={closed}")
-    return closed
+    if update_tracking:
+        for ticket_id in closed_ids:
+            _tracking_record_service(cur, ticket_id)
+
+    log.info(f"[CLOSE] Done  closed={len(closed_ids)}")
+    return len(closed_ids)
 
 
 def refresh_tracking(cur) -> None:
