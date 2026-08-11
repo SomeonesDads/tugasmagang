@@ -33,10 +33,14 @@ def _ticket_status(ticket):
     return f"Serviced: {serviced}"
 
 
-async def show_ticket_dashboard(update, context):
+async def show_ticket_dashboard(update, context, interactive=True):
     try:
         telegram_id = update.effective_user.id
-        payload = await get_tickets(telegram_id)
+        payload = await get_tickets(
+            telegram_id,
+            district_id=context.user_data.get("ticket_view_district"),
+            as_role=context.user_data.get("ticket_view_role"),
+        )
     except BackendAPIError as exc:
         await update.message.reply_text(f"❌ {exc}")
         return
@@ -76,10 +80,12 @@ async def show_ticket_dashboard(update, context):
     else:
         for number, ticket in enumerate(need_analyzing, start=1):
             text += f"{number}. {_ticket_label(ticket)}\n   Site: {ticket['site_id']} | Class: {_site_class(ticket)} | {_ticket_status(ticket)} | Aging: {ticket['aging']} hari\n\n"
-            context.user_data["ticket_list"].append(ticket)
-        text += "Balas dengan nomor tiket yang ingin diproses."
+            if interactive:
+                context.user_data["ticket_list"].append(ticket)
+        if interactive:
+            text += "Balas dengan nomor tiket yang ingin diproses."
 
-    context.user_data["waiting_ticket"] = bool(need_analyzing)
+    context.user_data["waiting_ticket"] = interactive and bool(need_analyzing)
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
 
@@ -137,7 +143,13 @@ async def process_text_input(update, context):
     so this single router is required instead of three overlapping TEXT
     handlers.
     """
-    if context.user_data.get("waiting_ticket"):
+    if context.user_data.get("admin_setup_step"):
+        from handlers.start import process_admin_setup
+        await process_admin_setup(update, context)
+    elif context.user_data.get("manager_mode"):
+        from handlers.management import process_manager_input
+        await process_manager_input(update, context)
+    elif context.user_data.get("waiting_ticket"):
         await select_ticket(update, context)
     elif context.user_data.get("waiting_rca"):
         from handlers.rca import input_rca
