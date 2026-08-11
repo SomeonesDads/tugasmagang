@@ -20,7 +20,7 @@ Endpoints
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 import psycopg2
@@ -160,6 +160,72 @@ class TicketsResponse(BaseModel):
     tickets: TicketGroups
 
 
+class IdentityResponse(BaseModel):
+    telegram_id: int
+    role: str
+    district: str
+
+
+class TrackingSummaryOut(BaseModel):
+    district: str
+    count_problems: int
+    solved_rca: int
+    solved_service: int
+    solved_rca_avg_time: Optional[float] = None
+    solved_service_avg_time: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class TrackingDetailOut(BaseModel):
+    district: str
+    rca_id: int
+    rca_name: str
+    count_problems: int
+    solved_rca: int
+    solved_service: int
+    solved_rca_avg_time: Optional[float] = None
+    solved_service_avg_time: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class SiteSummaryOut(BaseModel):
+    site_id: str
+    count_problems: int
+    solved_rca: int
+    solved_service: int
+    solved_rca_avg_time: Optional[float] = None
+    solved_service_avg_time: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class SiteListResponse(BaseModel):
+    district: str
+    sites: list[SiteSummaryOut]
+
+
+class SiteDetailOut(BaseModel):
+    site_id: str
+    rca_id: int
+    rca_name: str
+    count_problems: int
+    solved_rca: int
+    solved_service: int
+    solved_rca_avg_time: Optional[float] = None
+    solved_service_avg_time: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class TrackingDetailsResponse(BaseModel):
+    district: str
+    details: list[TrackingDetailOut]
+
+
+class SiteDetailsResponse(BaseModel):
+    district: str
+    site_id: str
+    details: list[SiteDetailOut]
+
+
 class RCAPatch(BaseModel):
     rca:        str
     rca_detail: str
@@ -217,6 +283,180 @@ def get_rca_options(conn=Depends(get_db)):
 
 # ── GET /api/engineers ───────────────────────────────────────────────────────
 
+def _resolve_assignment(
+    cur,
+    telegram_id: int,
+    role: Optional[str] = None,
+    district_override: Optional[str] = None,
+) -> tuple[str, str]:
+    """Resolve one unambiguous Telegram assignment and optionally enforce role."""
+    cur.execute("""
+        SELECT district_operation_do, role
+        FROM mba_sumbagut.telegram_district_role
+        WHERE telegram_id = %s
+    """, (telegram_id,))
+    assignments = cur.fetchall()
+    if not assignments:
+        raise HTTPException(status_code=404, detail="Telegram user is not assigned.")
+    districts = {
+        row["district_operation_do"] if hasattr(row, "keys") else row[0]
+        for row in assignments
+    }
+    roles = {
+        row["role"] if hasattr(row, "keys") else row[1]
+        for row in assignments
+    }
+    if len(districts) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
+    if len(roles) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple roles.")
+    actual_role = roles.pop()
+    if actual_role == "admin":
+        if role not in {"manager", "engineer"} or not district_override:
+            raise HTTPException(status_code=400, detail="Admin must select a role and district.")
+        return district_override, role
+    if role is not None and actual_role != role:
+        raise HTTPException(status_code=403, detail=f"Telegram user is not assigned as {role}.")
+    if district_override is not None and district_override not in districts:
+        raise HTTPException(status_code=403, detail="District is not assigned to this Telegram user.")
+    return district_override or districts.pop(), actual_role
+
+
+@app.get("/api/identity/{telegram_id}", response_model=IdentityResponse, summary="Resolve Telegram role and district")
+def get_identity(telegram_id: int, conn=Depends(get_db)):
+    with conn.cursor() as cur:
+        district, role = _resolve_assignment(cur, telegram_id)
+    return IdentityResponse(telegram_id=telegram_id, role=role, district=district)
+
+
+@app.get(
+    "/api/management/districts/{district_id}/managers",
+    summary="List managers assigned to a district",
+)
+def get_managers(district_id: str, conn=Depends(get_db)):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT telegram_id
+            FROM mba_sumbagut.telegram_district_role
+            WHERE district_operation_do = %s AND role = 'manager'
+            ORDER BY telegram_id
+        """, (district_id,))
+        managers = [row[0] for row in cur.fetchall()]
+    return {"district": district_id, "managers": managers}
+
+
+def _tracking_summary(cur, district: str) -> TrackingSummaryOut:
+    cur.execute("""
+        SELECT district, count_problems, solved_rca, solved_service,
+               solved_rca_avg_time, solved_service_avg_time, updated_at
+        FROM mba_sumbagut.tracking_summary
+        WHERE district = %s
+    """, (district,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Tracking summary is not available for this district.")
+    return TrackingSummaryOut(**dict(row))
+
+
+@app.get("/api/management/recap/{telegram_id}", response_model=TrackingSummaryOut, summary="Manager district recap")
+def get_management_recap(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+        return _tracking_summary(cur, district)
+
+
+@app.get(
+    "/api/management/recap/{telegram_id}/details",
+    response_model=TrackingDetailsResponse,
+    summary="Manager district RCA details",
+)
+def get_management_recap_details(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+        cur.execute("""
+            SELECT d.district, d.rca_id, r.name AS rca_name,
+                   d.count_problems, d.solved_rca, d.solved_service,
+                   d.solved_rca_avg_time, d.solved_service_avg_time, d.updated_at
+            FROM mba_sumbagut.tracking_detail d
+            JOIN mba_sumbagut.rca r ON r.rca_id = d.rca_id
+            WHERE d.district = %s
+            ORDER BY d.count_problems DESC, d.rca_id
+        """, (district,))
+        return TrackingDetailsResponse(district=district, details=[TrackingDetailOut(**dict(row)) for row in cur.fetchall()])
+
+
+@app.get(
+    "/api/management/recap/{telegram_id}/sites",
+    response_model=SiteListResponse,
+    summary="List manager district sites",
+)
+def get_management_sites(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+        cur.execute("""
+            SELECT ss.site_id, ss.count_problems, ss.solved_rca, ss.solved_service,
+                   ss.solved_rca_avg_time, ss.solved_service_avg_time, ss.updated_at
+            FROM mba_sumbagut.tracking_summary_site ss
+            WHERE EXISTS (
+                SELECT 1 FROM mba_sumbagut.ticket t
+                WHERE t.site_id = ss.site_id AND t.district_operation_do = %s
+            )
+            ORDER BY ss.site_id
+        """, (district,))
+        return SiteListResponse(district=district, sites=[SiteSummaryOut(**dict(row)) for row in cur.fetchall()])
+
+
+def _check_manager_site(cur, telegram_id: int, site_id: str, district_id: Optional[str] = None) -> str:
+    district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+    cur.execute("""
+        SELECT 1 FROM mba_sumbagut.ticket
+        WHERE site_id = %s AND district_operation_do = %s
+        LIMIT 1
+    """, (site_id, district))
+    if cur.fetchone() is None:
+        raise HTTPException(status_code=404, detail="Site is not assigned to the manager's district.")
+    return district
+
+
+@app.get(
+    "/api/management/recap/{telegram_id}/sites/{site_id}",
+    response_model=SiteSummaryOut,
+    summary="Manager site recap",
+)
+def get_management_site_recap(telegram_id: int, site_id: str, district_id: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        _check_manager_site(cur, telegram_id, site_id, district_id)
+        cur.execute("""
+            SELECT site_id, count_problems, solved_rca, solved_service,
+                   solved_rca_avg_time, solved_service_avg_time, updated_at
+            FROM mba_sumbagut.tracking_summary_site
+            WHERE site_id = %s
+        """, (site_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Tracking summary is not available for this site.")
+        return SiteSummaryOut(**dict(row))
+
+
+@app.get(
+    "/api/management/recap/{telegram_id}/sites/{site_id}/details",
+    response_model=SiteDetailsResponse,
+    summary="Manager site RCA details",
+)
+def get_management_site_details(telegram_id: int, site_id: str, district_id: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        district = _check_manager_site(cur, telegram_id, site_id, district_id)
+        cur.execute("""
+            SELECT d.site_id, d.rca_id, r.name AS rca_name,
+                   d.count_problems, d.solved_rca, d.solved_service,
+                   d.solved_rca_avg_time, d.solved_service_avg_time, d.updated_at
+            FROM mba_sumbagut.tracking_detail_site d
+            JOIN mba_sumbagut.rca r ON r.rca_id = d.rca_id
+            WHERE d.site_id = %s
+            ORDER BY d.count_problems DESC, d.rca_id
+        """, (site_id,))
+        return SiteDetailsResponse(district=district, site_id=site_id, details=[SiteDetailOut(**dict(row)) for row in cur.fetchall()])
+
 @app.get("/api/engineers", summary="List all engineers and districts")
 def get_engineers(conn=Depends(get_db)):
     """Return all engineer Telegram IDs with their assigned district."""
@@ -256,35 +496,26 @@ def get_mock_engineer_tickets(telegram_id: int):
 @app.get(
     "/api/tickets/{telegram_id}",
     response_model=TicketsResponse,
-    summary="All tickets for an engineer's district",
+    summary="All tickets for an engineer or manager's district",
 )
-def get_tickets(telegram_id: int, conn=Depends(get_db)):
+def get_tickets(
+    telegram_id: int,
+    district_id: Optional[str] = None,
+    as_role: Optional[str] = None,
+    conn=Depends(get_db),
+):
     """
-    Resolve the engineer's district from the standalone Telegram assignment,
+    Resolve the user's district from the standalone Telegram assignment,
     then return all tickets in that district ordered by aging and creation date.
 
     Note: `serviced=true` tickets are included for now.
     Once the system is stable, filter them out here.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("""
-            SELECT district_operation_do
-            FROM mba_sumbagut.telegram_district_role
-            WHERE telegram_id = %s AND role = 'engineer'
-        """, (telegram_id,))
-        assignments = cur.fetchall()
-        if not assignments:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Engineer Telegram ID {telegram_id} is not assigned to a district.",
-            )
-        districts = {row["district_operation_do"] for row in assignments}
-        if len(districts) > 1:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Engineer Telegram ID {telegram_id} has multiple district assignments.",
-            )
-        district_id = districts.pop()
+        requested_role = as_role if as_role in {"engineer", "manager"} else None
+        district_id, role = _resolve_assignment(cur, telegram_id, requested_role, district_id)
+        if role not in {"engineer", "manager"}:
+            raise HTTPException(status_code=403, detail="Role cannot view tickets.")
 
         cur.execute("""
             WITH ticket_state AS (
