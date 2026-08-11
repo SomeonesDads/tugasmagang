@@ -18,7 +18,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if identity["role"] == "admin":
         context.user_data["admin_setup_step"] = "role"
         await update.message.reply_text(
-            "Admin mode. Pilih fitur yang ingin diuji:",
+            "Admin mode. Simulasikan sebagai Manager atau Engineer:",
             reply_markup=ReplyKeyboardMarkup([["Manager"], ["Engineer"]], resize_keyboard=True),
         )
     elif identity["role"] == "manager":
@@ -39,7 +39,7 @@ async def process_admin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["admin_view_role"] = normalized
         context.user_data["admin_setup_step"] = "district"
         await update.message.reply_text(
-            "Masukkan district_operation_do:",
+            "Masukkan district_operation_do yang ingin digunakan:",
             reply_markup=ReplyKeyboardRemove(),
         )
         return

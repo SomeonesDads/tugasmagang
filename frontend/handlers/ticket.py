@@ -64,22 +64,22 @@ async def show_ticket_dashboard(update, context, interactive=True):
 
     text = (
         f"TICKET DASHBOARD — {payload['district']}\n\n"
-        "Format: #ID TYPE (DD/MM/YY)_SITE_IDENTIFIER\n"
-        "Serviced: ✅ sudah selesai | ❌ belum selesai\n\n"
+        "Format:\n#ID ZP (DD/MM/YY)_SITE_EnodeBID_Cell\natau\n#ID ZT (DD/MM/YY)_SITE_Lac_Ci\n"
+        "============================================\n"
         "Need Servicing\n\n"
     )
     if not need_servicing:
         text += "Tidak ada tiket.\n\n"
     else:
         for ticket in need_servicing:
-            text += f"- {_ticket_label(ticket)}\n  Site: {ticket['site_id']} | Class: {_site_class(ticket)} | {_ticket_status(ticket)}\n\n"
+            text += f"- {_ticket_label(ticket)}\nAging: {ticket['aging']} hari | Class: {_site_class(ticket)}\n\n"
 
     text += "Need Analyzing\n\n"
     if not need_analyzing:
         text += "Tidak ada tiket."
     else:
         for number, ticket in enumerate(need_analyzing, start=1):
-            text += f"{number}. {_ticket_label(ticket)}\n   Site: {ticket['site_id']} | Class: {_site_class(ticket)} | {_ticket_status(ticket)} | Aging: {ticket['aging']} hari\n\n"
+            text += f"{number}. {_ticket_label(ticket)}\nAging: {ticket['aging']} hari | Class: {_site_class(ticket)} | {_ticket_status(ticket)} \n\n"
             if interactive:
                 context.user_data["ticket_list"].append(ticket)
         if interactive:

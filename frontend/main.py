@@ -12,7 +12,7 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # /start opens the current ticket dashboard directly.
+    # /start opens the dashboard appropriate to the Telegram user's role.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("notify_engineers", notify_engineers))
 
