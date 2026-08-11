@@ -37,8 +37,36 @@ async def _request(method, path, **kwargs):
     raise BackendAPIError("Backend gagal memproses permintaan. Coba lagi.")
 
 
-async def get_tickets(telegram_id):
-    return await _request("GET", f"/tickets/{telegram_id}")
+async def get_tickets(telegram_id, district_id=None, as_role=None):
+    params = {key: value for key, value in {
+        "district_id": district_id,
+        "as_role": as_role,
+    }.items() if value is not None}
+    return await _request("GET", f"/tickets/{telegram_id}", params=params)
+
+
+async def get_identity(telegram_id):
+    return await _request("GET", f"/identity/{telegram_id}")
+
+
+async def get_management_recap(telegram_id, district_id=None):
+    return await _request("GET", f"/management/recap/{telegram_id}", params={"district_id": district_id} if district_id else {})
+
+
+async def get_management_details(telegram_id, district_id=None):
+    return await _request("GET", f"/management/recap/{telegram_id}/details", params={"district_id": district_id} if district_id else {})
+
+
+async def get_management_sites(telegram_id, district_id=None):
+    return await _request("GET", f"/management/recap/{telegram_id}/sites", params={"district_id": district_id} if district_id else {})
+
+
+async def get_management_site_recap(telegram_id, site_id, district_id=None):
+    return await _request("GET", f"/management/recap/{telegram_id}/sites/{site_id}", params={"district_id": district_id} if district_id else {})
+
+
+async def get_management_site_details(telegram_id, site_id, district_id=None):
+    return await _request("GET", f"/management/recap/{telegram_id}/sites/{site_id}/details", params={"district_id": district_id} if district_id else {})
 
 
 async def get_engineers():
