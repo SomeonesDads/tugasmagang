@@ -178,6 +178,10 @@ class TrackingSummaryOut(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class TrackingSummariesResponse(BaseModel):
+    districts: list[TrackingSummaryOut]
+
+
 class TrackingDetailOut(BaseModel):
     district: str
     rca_id: int
@@ -310,13 +314,58 @@ def _resolve_assignment(
         if role not in {"manager", "engineer"} or not district_override:
             raise HTTPException(status_code=400, detail="Admin must select a role and district.")
         return district_override, role
-    if len(districts) > 1:
-        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
     if role is not None and actual_role != role:
         raise HTTPException(status_code=403, detail=f"Telegram user is not assigned as {role}.")
+    # Managers temporarily have portfolio-wide visibility while the NOP-to-
+    # district mapping is being established. Engineers remain district-scoped.
+    if actual_role == "manager" and district_override is not None:
+        return district_override, actual_role
     if district_override is not None and district_override not in districts:
         raise HTTPException(status_code=403, detail="District is not assigned to this Telegram user.")
+    if len(districts) > 1:
+        raise HTTPException(status_code=409, detail="Telegram user has multiple district assignments.")
     return district_override or districts.pop(), actual_role
+
+
+def _resolve_manager_scope(cur, telegram_id: int, district_id: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """Resolve a manager's NPO scope and optionally a district within it.
+
+    Manager assignments keep using the existing district_operation_do column;
+    for managers its value is the NPO/departement_ns identifier. Districts are
+    discovered from mapping_sysinfo_geohash rather than stored assignments.
+    """
+    cur.execute("""
+        SELECT DISTINCT role, district_operation_do
+        FROM mba_sumbagut.telegram_district_role
+        WHERE telegram_id = %s
+    """, (telegram_id,))
+    assignments = cur.fetchall()
+    if not assignments:
+        raise HTTPException(status_code=404, detail="Telegram user is not assigned.")
+
+    roles = {row["role"] for row in assignments}
+    if roles == {"admin"}:
+        if not district_id:
+            raise HTTPException(status_code=400, detail="Admin must select an NPO.")
+        return district_id, None
+    if roles != {"manager"}:
+        raise HTTPException(status_code=403, detail="Telegram user is not assigned as manager.")
+
+    npos = {row["district_operation_do"] for row in assignments}
+    if len(npos) != 1:
+        raise HTTPException(status_code=409, detail="Manager must have exactly one NPO assignment.")
+    npo = npos.pop()
+
+    if district_id is not None:
+        cur.execute("""
+            SELECT 1
+            FROM sumatera.mapping_sysinfo_geohash
+            WHERE departement_ns = %s AND district_operation_do = %s
+            LIMIT 1
+        """, (npo, district_id))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=403, detail="District is not assigned to the manager's NPO.")
+    return npo, district_id
 
 
 @app.get("/api/identity/{telegram_id}", response_model=IdentityResponse, summary="Resolve Telegram role and district")
@@ -385,11 +434,63 @@ def _tracking_summary(cur, district: str) -> TrackingSummaryOut:
     return TrackingSummaryOut(**dict(row))
 
 
+@app.get(
+    "/api/management/recap/{telegram_id}/districts",
+    response_model=TrackingSummariesResponse,
+    summary="Manager NPO district recap",
+)
+def get_management_districts(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
+    """Return district performance for the manager's NPO."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        npo, _ = _resolve_manager_scope(cur, telegram_id, district_id)
+        cur.execute("""
+            SELECT mapping.district_operation_do AS district,
+                   COUNT(DISTINCT t.ticket_id) AS count_problems,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE r.submitted_at IS NOT NULL) AS solved_rca,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service,
+                   AVG((r.end_day - t.created_date)::numeric) FILTER (WHERE r.end_day IS NOT NULL) AS solved_rca_avg_time,
+                   AVG((s.end_day - s.start_day)::numeric) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service_avg_time,
+                   now() AS updated_at
+            FROM mba_sumbagut.ticket t
+            JOIN sumatera.mapping_sysinfo_geohash mapping
+              ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+            LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+            LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+            WHERE mapping.departement_ns = %s
+            GROUP BY mapping.district_operation_do
+            ORDER BY count_problems DESC, district
+        """, (npo,))
+        return TrackingSummariesResponse(
+            districts=[TrackingSummaryOut(**dict(row)) for row in cur.fetchall()]
+        )
+
+
 @app.get("/api/management/recap/{telegram_id}", response_model=TrackingSummaryOut, summary="Manager district recap")
 def get_management_recap(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
-        return _tracking_summary(cur, district)
+        npo, district = _resolve_manager_scope(cur, telegram_id, district_id)
+        if district is None:
+            raise HTTPException(status_code=400, detail="District is required for a manager recap.")
+        cur.execute("""
+            SELECT mapping.district_operation_do AS district,
+                   COUNT(DISTINCT t.ticket_id) AS count_problems,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE r.submitted_at IS NOT NULL) AS solved_rca,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service,
+                   AVG((r.end_day - t.created_date)::numeric) FILTER (WHERE r.end_day IS NOT NULL) AS solved_rca_avg_time,
+                   AVG((s.end_day - s.start_day)::numeric) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service_avg_time,
+                   now() AS updated_at
+            FROM mba_sumbagut.ticket t
+            JOIN sumatera.mapping_sysinfo_geohash mapping
+              ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+            LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+            LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+            WHERE mapping.departement_ns = %s AND mapping.district_operation_do = %s
+            GROUP BY mapping.district_operation_do
+        """, (npo, district))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Tracking summary is not available for this district.")
+        return TrackingSummaryOut(**dict(row))
 
 
 @app.get(
@@ -399,16 +500,28 @@ def get_management_recap(telegram_id: int, district_id: Optional[str] = None, co
 )
 def get_management_recap_details(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+        npo, district = _resolve_manager_scope(cur, telegram_id, district_id)
+        if district is None:
+            raise HTTPException(status_code=400, detail="District is required for manager details.")
         cur.execute("""
-            SELECT d.district, d.rca_id, r.name AS rca_name,
-                   d.count_problems, d.solved_rca, d.solved_service,
-                   d.solved_rca_avg_time, d.solved_service_avg_time, d.updated_at
-            FROM mba_sumbagut.tracking_detail d
-            JOIN mba_sumbagut.rca r ON r.rca_id = d.rca_id
-            WHERE d.district = %s
-            ORDER BY d.count_problems DESC, d.rca_id
-        """, (district,))
+            SELECT mapping.district_operation_do AS district, r.rca_id,
+                   rca.name AS rca_name, COUNT(*) AS count_problems,
+                   COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL) AS solved_rca,
+                   COUNT(*) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service,
+                   AVG((r.end_day - t.created_date)::numeric) FILTER (WHERE r.end_day IS NOT NULL) AS solved_rca_avg_time,
+                   AVG((s.end_day - s.start_day)::numeric) FILTER (WHERE s.end_day IS NOT NULL) AS solved_service_avg_time,
+                   now() AS updated_at
+            FROM mba_sumbagut.ticket t
+            JOIN sumatera.mapping_sysinfo_geohash mapping
+              ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+            JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+            JOIN mba_sumbagut.rca rca ON rca.rca_id = r.rca_id
+            LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+            WHERE mapping.departement_ns = %s
+              AND mapping.district_operation_do = %s
+            GROUP BY mapping.district_operation_do, r.rca_id, rca.name
+            ORDER BY count_problems DESC, r.rca_id
+        """, (npo, district))
         return TrackingDetailsResponse(district=district, details=[TrackingDetailOut(**dict(row)) for row in cur.fetchall()])
 
 
@@ -419,30 +532,40 @@ def get_management_recap_details(telegram_id: int, district_id: Optional[str] = 
 )
 def get_management_sites(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+        npo, district = _resolve_manager_scope(cur, telegram_id, district_id)
         cur.execute("""
             SELECT ss.site_id, ss.count_problems, ss.solved_rca, ss.solved_service,
                    ss.solved_rca_avg_time, ss.solved_service_avg_time, ss.updated_at
             FROM mba_sumbagut.tracking_summary_site ss
             WHERE EXISTS (
                 SELECT 1 FROM mba_sumbagut.ticket t
-                WHERE t.site_id = ss.site_id AND t.district_operation_do = %s
+                JOIN sumatera.mapping_sysinfo_geohash mapping
+                  ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+                WHERE t.site_id = ss.site_id
+                  AND mapping.departement_ns = %s
+                  AND (%s IS NULL OR mapping.district_operation_do = %s)
             )
             ORDER BY ss.site_id
-        """, (district,))
-        return SiteListResponse(district=district, sites=[SiteSummaryOut(**dict(row)) for row in cur.fetchall()])
+        """, (npo, district, district))
+        return SiteListResponse(district=district or npo, sites=[SiteSummaryOut(**dict(row)) for row in cur.fetchall()])
 
 
 def _check_manager_site(cur, telegram_id: int, site_id: str, district_id: Optional[str] = None) -> str:
-    district, _ = _resolve_assignment(cur, telegram_id, "manager", district_id)
+    npo, district = _resolve_manager_scope(cur, telegram_id, district_id)
     cur.execute("""
-        SELECT 1 FROM mba_sumbagut.ticket
-        WHERE site_id = %s AND district_operation_do = %s
+        SELECT mapping.district_operation_do
+        FROM mba_sumbagut.ticket t
+        JOIN sumatera.mapping_sysinfo_geohash mapping
+          ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+        WHERE t.site_id = %s
+          AND mapping.departement_ns = %s
+          AND (%s IS NULL OR mapping.district_operation_do = %s)
         LIMIT 1
-    """, (site_id, district))
-    if cur.fetchone() is None:
-        raise HTTPException(status_code=404, detail="Site is not assigned to the manager's district.")
-    return district
+    """, (site_id, npo, district, district))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Site is not assigned to the manager's NPO.")
+    return district or row[0]
 
 
 @app.get(
@@ -523,7 +646,7 @@ def get_mock_engineer_tickets(telegram_id: int):
 @app.get(
     "/api/tickets/{telegram_id}",
     response_model=TicketsResponse,
-    summary="All tickets for an engineer or manager's district",
+    summary="Tickets for an engineer district or manager NPO",
 )
 def get_tickets(
     telegram_id: int,
@@ -532,15 +655,20 @@ def get_tickets(
     conn=Depends(get_db),
 ):
     """
-    Resolve the user's district from the standalone Telegram assignment,
-    then return all tickets in that district ordered by aging and creation date.
+    Resolve the engineer's district or manager's NPO scope, then return
+    matching tickets ordered by aging and creation date.
 
     Note: `serviced=true` tickets are included for now.
     Once the system is stable, filter them out here.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         requested_role = as_role if as_role in {"engineer", "manager"} else None
-        district_id, role = _resolve_assignment(cur, telegram_id, requested_role, district_id)
+        if requested_role == "manager":
+            npo, selected_district = _resolve_manager_scope(cur, telegram_id, district_id)
+            district_id, role = selected_district, "manager"
+        else:
+            npo = None
+            district_id, role = _resolve_assignment(cur, telegram_id, requested_role, district_id)
         if role not in {"engineer", "manager"}:
             raise HTTPException(status_code=403, detail="Role cannot view tickets.")
 
@@ -560,11 +688,16 @@ def get_tickets(
                  AND mapping.region = 'SUMBAGUT'
                 LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
                 LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
-                WHERE t.district_operation_do = %s
+                WHERE (
+                    (%s = 'manager' AND mapping.departement_ns = %s
+                     AND (%s IS NULL OR mapping.district_operation_do = %s))
+                    OR
+                    (%s <> 'manager' AND t.district_operation_do = %s)
+                )
             )
             SELECT * FROM ticket_state
             WHERE NOT (rca_done AND serviced_done)
-        """, (district_id,))
+        """, (role, npo, district_id, district_id, role, district_id))
 
         rows = cur.fetchall()
 

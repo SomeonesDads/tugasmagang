@@ -53,6 +53,14 @@ async def get_management_recap(telegram_id, district_id=None):
     return await _request("GET", f"/management/recap/{telegram_id}", params={"district_id": district_id} if district_id else {})
 
 
+async def get_management_districts(telegram_id, npo=None):
+    return await _request(
+        "GET",
+        f"/management/recap/{telegram_id}/districts",
+        params={"district_id": npo} if npo else {},
+    )
+
+
 async def get_management_details(telegram_id, district_id=None):
     return await _request("GET", f"/management/recap/{telegram_id}/details", params={"district_id": district_id} if district_id else {})
 

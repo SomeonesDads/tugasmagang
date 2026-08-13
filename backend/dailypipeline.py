@@ -4,10 +4,9 @@ Ticket generation pipeline for SRI ZP / ZT anomalies.
 
 Two entry points
 ────────────────
-  seed_pipeline()   — Run ONCE to bootstrap from historical feed data.
+  seed_pipeline()   — Run ONCE to bootstrap from the latest feed data.
                       Scans the most recent feed date, finds all cells with no
-                      open ticket, and computes accurate historical aging by
-                      walking back consecutive dates in the feed tables.
+                      open ticket, and copies feed-provided aging.
 
   daily_pipeline()  — Run every day after seeding.
                       Any cell that's still a problem already has an open ticket
@@ -84,49 +83,6 @@ def resolve_district(cur, site_id: str) -> str | None:
     """, (site_id,))
     row = cur.fetchone()
     return row[0] if row else None
-
-
-def compute_aging(cur, table: str, filters: dict, today: date) -> int:
-    """
-    Count how many *consecutive* days ending on `today` the given cell
-    appears in `table`.  Returns at least 1.
-
-    Used only by seed_pipeline().  The daily pipeline doesn't need this
-    because any cell that has been recurring already has an open ticket —
-    only genuinely new cells reach the insert step, so aging = 1 there.
-
-    `filters` is a dict of {column_name: value} used as WHERE conditions.
-    Example for ZP:  {'enodeb_id': 100, 'cell_id': 5, 'site_id': 'ABCD'}
-    Example for ZT:  {'lac': 300, 'ci': 7, 'site_id': 'ABCD'}
-
-    No row limit — the streak is naturally bounded by what's in the table.
-    An arbitrary cap would silently undercount long-running problems.
-    """
-    where_clause = " AND ".join(f'"{col}" = %s' for col in filters)
-    where_vals   = list(filters.values())
-
-    cur.execute(f"""
-        SELECT DISTINCT "date"
-        FROM mba_sumbagut.{table}
-        WHERE {where_clause}
-          AND "date" <= %s
-        ORDER BY "date" DESC
-    """, (*where_vals, today))
-
-    dates = [row[0] for row in cur.fetchall()]
-
-    if not dates or dates[0] != today:
-        # Shouldn't happen during normal seed flow, but guard anyway.
-        return 1
-
-    count = 1
-    for i in range(1, len(dates)):
-        if (dates[i - 1] - dates[i]).days == 1:
-            count += 1
-        else:
-            break   # gap found — consecutive streak ends here
-
-    return count
 
 
 def _tracking_add_ticket(cur, ticket_id: int) -> None:
@@ -336,7 +292,7 @@ def _ensure_service_rows(cur) -> None:
 # ── Shared: dedup query — cells in today's feed with NO active open ticket ────
 
 _ZP_NEW_CELLS_SQL = """
-    SELECT DISTINCT zp.enodeb_id, zp.cell_id, zp.site_id
+    SELECT zp.enodeb_id, zp.cell_id, zp.site_id, MAX(zp.aging) AS aging
     FROM mba_sumbagut.sri_zp_daily zp
     WHERE zp."date" = %s
       AND zp.enodeb_id IS NOT NULL
@@ -351,10 +307,11 @@ _ZP_NEW_CELLS_SQL = """
             AND t.site_id     = zp.site_id
             AND (ts.ticket_id IS NULL OR ts.end_day IS NULL)
       )
+    GROUP BY zp.enodeb_id, zp.cell_id, zp.site_id
 """
 
 _ZT_NEW_CELLS_SQL = """
-    SELECT DISTINCT zt.lac, zt.ci, zt.site_id
+    SELECT zt.lac, zt.ci, zt.site_id, MAX(zt.aging) AS aging
     FROM mba_sumbagut.sri_zt_daily zt
     WHERE zt."date" = %s
       AND zt.lac    IS NOT NULL
@@ -369,6 +326,7 @@ _ZT_NEW_CELLS_SQL = """
             AND t.site_id     = zt.site_id
             AND (ts.ticket_id IS NULL OR ts.end_day IS NULL)
       )
+    GROUP BY zt.lac, zt.ci, zt.site_id
 """
 
 
@@ -376,26 +334,22 @@ _ZT_NEW_CELLS_SQL = """
 # SEED PIPELINE
 # Run once on first deploy (or to re-bootstrap after a gap).
 # Finds all cells in the most recent feed date that have no open ticket and
-# computes accurate historical aging by walking back consecutive dates.
+# copies aging from the latest feed snapshot.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _seed_zp_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[int, int]:
     """
     Seed pass for ZP: create tickets for all cells in today's feed
-    that have no active open ticket, with aging computed from feed history.
+    that have no active open ticket, using feed-provided aging.
     """
     log.info(f"[SEED/ZP] Pass  today={today}")
     cur.execute(_ZP_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for enodeb_id, cell_id, site_id in rows:
+    for enodeb_id, cell_id, site_id, aging in rows:
         try:
             district = resolve_district(cur, site_id)
-            aging = compute_aging(
-                cur, "sri_zp_daily",
-                {"enodeb_id": enodeb_id, "cell_id": cell_id, "site_id": site_id},
-                today,
-            )
+            aging = max(1, aging or 1)
             params = ("ZP", enodeb_id, cell_id, None, None,
                       site_id, district, today, aging)
             tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
@@ -415,20 +369,16 @@ def _seed_zp_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[i
 
 def _seed_zt_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[int, int]:
     """
-    Seed pass for ZT: same logic using lac/ci and sri_zt_daily history.
+    Seed pass for ZT: same logic using lac/ci and feed-provided aging.
     """
     log.info(f"[SEED/ZT] Pass  today={today}")
     cur.execute(_ZT_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for lac, ci, site_id in rows:
+    for lac, ci, site_id, aging in rows:
         try:
             district = resolve_district(cur, site_id)
-            aging = compute_aging(
-                cur, "sri_zt_daily",
-                {"lac": lac, "ci": ci, "site_id": site_id},
-                today,
-            )
+            aging = max(1, aging or 1)
             params = ("ZT", None, None, lac, ci,
                       site_id, district, today, aging)
             tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
@@ -446,7 +396,7 @@ def _seed_zt_pass(cur, today: date, *, update_tracking: bool = False) -> tuple[i
 
 def seed_pipeline() -> None:
     """
-    Bootstrap the ticket table from historical feed data.
+    Bootstrap the ticket table from the latest feed snapshots.
     Safe to re-run — the unique indexes on ticket prevent duplicates.
     """
     log.info("=" * 60)
@@ -457,23 +407,9 @@ def seed_pipeline() -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    'SELECT DISTINCT "date" '
-                    'FROM mba_sumbagut.sri_zp_daily '
-                    'WHERE "date" IS NOT NULL '
-                    'ORDER BY "date"'
-                )
-                zp_dates = {row[0] for row in cur.fetchall()}
-                cur.execute(
-                    'SELECT DISTINCT "date" '
-                    'FROM mba_sumbagut.sri_zt_daily '
-                    'WHERE "date" IS NOT NULL '
-                    'ORDER BY "date"'
-                )
-                zt_dates = {row[0] for row in cur.fetchall()}
-                feed_dates = sorted(zp_dates | zt_dates)
-
-                if not feed_dates:
+                zp_date = get_feed_date(cur, "sri_zp_daily")
+                zt_date = get_feed_date(cur, "sri_zt_daily")
+                if zp_date is None and zt_date is None:
                     log.warning("No data in either feed table. Nothing to seed.")
                     return
 
@@ -482,20 +418,12 @@ def seed_pipeline() -> None:
                 zt_created = zt_skipped = 0
                 total_closed = 0
 
-                # Replay the complete feed history. Closing before inserting
-                # today's cells allows a cell that returned after a gap to get
-                # a new ticket instead of being blocked by its old one.
-                for feed_date in feed_dates:
-                    closed = _run_close_pass(cur, feed_date, update_tracking=False)
-                    total_closed += closed
-                    if feed_date in zp_dates:
-                        created, skipped = _seed_zp_pass(cur, feed_date, update_tracking=False)
-                        zp_created += created
-                        zp_skipped += skipped
-                    if feed_date in zt_dates:
-                        created, skipped = _seed_zt_pass(cur, feed_date, update_tracking=False)
-                        zt_created += created
-                        zt_skipped += skipped
+                today = max(d for d in (zp_date, zt_date) if d is not None)
+                total_closed = _run_close_pass(cur, today, update_tracking=False)
+                if zp_date == today:
+                    zp_created, zp_skipped = _seed_zp_pass(cur, today, update_tracking=False)
+                if zt_date == today:
+                    zt_created, zt_skipped = _seed_zt_pass(cur, today, update_tracking=False)
 
                 refresh_tracking(cur)
 
@@ -532,7 +460,7 @@ def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZP_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for enodeb_id, cell_id, site_id in rows:
+    for enodeb_id, cell_id, site_id, _feed_aging in rows:
         try:
             district = resolve_district(cur, site_id)
             # aging = 1: this cell has no open ticket, meaning it's a genuinely
@@ -562,7 +490,7 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     cur.execute(_ZT_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for lac, ci, site_id in rows:
+    for lac, ci, site_id, _feed_aging in rows:
         try:
             district = resolve_district(cur, site_id)
             params = ("ZT", None, None, lac, ci,

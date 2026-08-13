@@ -37,26 +37,26 @@ async def process_admin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("Pilih Manager atau Engineer.")
             return
         context.user_data["admin_view_role"] = normalized
-        context.user_data["admin_setup_step"] = "district"
+        context.user_data["admin_setup_step"] = "scope"
         await update.message.reply_text(
-            "Masukkan district_operation_do yang ingin digunakan:",
+            "Masukkan departement_ns / NPO yang ingin digunakan:",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    if step == "district":
-        district = message
-        if not district:
-            await update.message.reply_text("District tidak boleh kosong.")
+    if step == "scope":
+        scope = message
+        if not scope:
+            await update.message.reply_text("NPO tidak boleh kosong.")
             return
-        context.user_data["admin_view_district"] = district
+        context.user_data["admin_view_district"] = scope
         context.user_data.pop("admin_setup_step", None)
         if context.user_data["admin_view_role"] == "manager":
             context.user_data["manager_mode"] = True
-            context.user_data["ticket_view_district"] = district
+            context.user_data["ticket_view_district"] = scope
             context.user_data["ticket_view_role"] = "manager"
             await show_manager_dashboard(update, context)
         else:
-            context.user_data["ticket_view_district"] = district
+            context.user_data["ticket_view_district"] = scope
             context.user_data["ticket_view_role"] = "engineer"
             await show_ticket_dashboard(update, context)

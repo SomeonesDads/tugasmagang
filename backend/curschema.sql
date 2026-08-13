@@ -1234,7 +1234,8 @@ CREATE TABLE mba_sumbagut.sri_zt_daily (
 	ci int4 NULL,
 	band varchar(10) NULL,
 	rbs_type bpchar(2) NULL,
-	traffic_total float4 NULL
+	traffic_total float4 NULL,
+	aging int4 NULL
 );
 
 

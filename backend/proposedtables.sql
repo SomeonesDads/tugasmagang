@@ -38,8 +38,7 @@ CREATE SEQUENCE mba_sumbagut.ticket_id_seq
 -- district_operation_do is denormalized from site_reference at creation time
 -- so routing is self-contained without a cross-pipeline_run_id join later.
 --
--- aging: for ZP, copied directly from sri_zp_daily.aging.
---        for ZT, computed as consecutive-day count (done in pipeline).
+-- aging: copied directly from the corresponding feed table.
 
 CREATE TABLE mba_sumbagut.ticket (
     ticket_id               bigint          NOT NULL DEFAULT nextval('mba_sumbagut.ticket_id_seq'),

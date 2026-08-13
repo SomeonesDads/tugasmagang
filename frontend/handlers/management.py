@@ -5,6 +5,7 @@ from telegram.ext import ContextTypes
 
 from api_client import (
     BackendAPIError,
+    get_management_districts,
     get_management_details,
     get_management_recap,
     get_management_site_details,
@@ -12,7 +13,8 @@ from api_client import (
 )
 
 
-DISTRICT_MENU = [["More Info", "Site Info"], ["Active Tickets"]]
+DISTRICT_MENU = [["Select District"], ["Active Tickets"]]
+SELECTED_DISTRICT_MENU = [["More Info", "Site Info"], ["Active Tickets"], ["All Districts"]]
 SITE_MENU = [["More Info", "District Info"], ["Active Tickets"]]
 BACK_MENU = [["Back"]]
 
@@ -37,7 +39,7 @@ def _back_menu():
 
 def _district(context):
     """Use the admin-selected district when the user is simulating a manager."""
-    return context.user_data.get("admin_view_district")
+    return context.user_data.get("manager_current_district") or context.user_data.get("admin_view_district")
 
 
 def _summary_text(summary, label):
@@ -52,21 +54,59 @@ def _summary_text(summary, label):
 
 
 async def show_manager_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu 1: district-level overview, opened by /start."""
+    """Show district performance for the manager's NPO."""
     try:
-        summary = await get_management_recap(update.effective_user.id, _district(context))
+        payload = await get_management_districts(
+            update.effective_user.id,
+            context.user_data.get("admin_view_district"),
+        )
     except BackendAPIError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
 
     context.user_data["manager_mode"] = True
-    context.user_data["manager_screen"] = "district"
+    context.user_data["manager_screen"] = "districts"
     context.user_data["manager_waiting_site"] = False
+    context.user_data["manager_waiting_district"] = False
+    context.user_data["manager_districts"] = payload["districts"]
     context.user_data.pop("manager_current_site", None)
+    context.user_data.pop("manager_current_district", None)
+    lines = ["DISTRICT PERFORMANCE", "All districts", ""]
+    if not payload["districts"]:
+        lines.append("Tidak ada data district.")
+    else:
+        for summary in payload["districts"]:
+            lines.append(_summary_text(summary, "District"))
     await update.effective_message.reply_text(
-        "DISTRICT RECAP\nDistrict-level overview\n\n"
-        + _summary_text(summary, "District"),
+        "\n\n".join(lines),
         reply_markup=_district_menu(),
+    )
+
+
+async def prompt_for_district(update, context):
+    districts = context.user_data.get("manager_districts", [])
+    choices = "\n".join(
+        f"{number}. {summary['district']}"
+        for number, summary in enumerate(districts, start=1)
+    )
+    context.user_data["manager_waiting_district"] = True
+    await update.effective_message.reply_text(
+        "Pilih district dengan membalas nomornya:\n\n" + choices,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def show_selected_district(update, context, district):
+    try:
+        summary = await get_management_recap(update.effective_user.id, district)
+    except BackendAPIError as exc:
+        await update.effective_message.reply_text(f"Error: {exc}")
+        return
+    context.user_data["manager_current_district"] = district
+    context.user_data["manager_screen"] = "district"
+    await update.effective_message.reply_text(
+        "DISTRICT RECAP\nDetailed district view\n\n" + _summary_text(summary, "District"),
+        reply_markup=ReplyKeyboardMarkup(SELECTED_DISTRICT_MENU, resize_keyboard=True, is_persistent=True),
     )
 
 
@@ -171,6 +211,13 @@ async def show_manager_site_details(update, context, site_id):
 
 async def show_manager_tickets(update, context):
     """Menu 3: engineer-like dashboard with all input disabled."""
+    if not _district(context):
+        await update.effective_message.reply_text("Pilih district terlebih dahulu.", reply_markup=_district_menu())
+        return
+    # Manager ticket access is NPO-scoped; the optional district narrows the
+    # read-only view to the selected district.
+    context.user_data["ticket_view_role"] = "manager"
+    context.user_data["ticket_view_district"] = _district(context)
     from handlers.ticket import show_ticket_dashboard
 
     await show_ticket_dashboard(update, context, interactive=False)
@@ -203,7 +250,23 @@ async def process_manager_input(update, context):
         await show_manager_site_details(update, context, sites[number - 1]["site_id"])
         return
 
+    if context.user_data.get("manager_waiting_district"):
+        if not message.isdigit():
+            await update.message.reply_text("Masukkan nomor district.")
+            return
+        districts = context.user_data.get("manager_districts", [])
+        number = int(message)
+        if number < 1 or number > len(districts):
+            await update.message.reply_text("Nomor district tidak ditemukan.")
+            return
+        context.user_data["manager_waiting_district"] = False
+        await show_selected_district(update, context, districts[number - 1]["district"])
+        return
+
     screen = context.user_data.get("manager_screen", "district")
+    if message == "Select District":
+        await prompt_for_district(update, context)
+        return
     if message == "More Info":
         if screen == "district":
             await show_manager_details(update, context)
@@ -217,6 +280,8 @@ async def process_manager_input(update, context):
             await show_manager_sites(update, context)
         return
     if message == "District Info":
+        await show_manager_dashboard(update, context)
+    elif message == "All Districts":
         await show_manager_dashboard(update, context)
     elif message == "Site Info":
         await show_manager_sites(update, context)
