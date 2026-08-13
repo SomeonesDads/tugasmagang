@@ -67,6 +67,12 @@ def get_feed_date(cur, table: str) -> date | None:
     return row[0] if row else None
 
 
+def feed_has_date(cur, table: str, feed_date: date) -> bool:
+    """Return whether a feed table contains a snapshot for ``feed_date``."""
+    cur.execute(f'SELECT EXISTS (SELECT 1 FROM mba_sumbagut.{table} WHERE "date" = %s)', (feed_date,))
+    return bool(cur.fetchone()[0])
+
+
 def resolve_district(cur, site_id: str) -> str | None:
     """
     Resolve district_operation_do for a site_id from the most recent
@@ -330,6 +336,52 @@ _ZT_NEW_CELLS_SQL = """
 """
 
 
+def _update_active_zp_aging(cur, today: date) -> None:
+    """Update aging for active ZP tickets from today's feed snapshot."""
+    cur.execute("""
+        UPDATE mba_sumbagut.ticket t
+        SET aging = COALESCE(feed.aging, 1)
+        FROM (
+            SELECT enodeb_id, cell_id, site_id, MAX(aging) AS aging
+            FROM mba_sumbagut.sri_zp_daily
+            WHERE "date" = %s
+              AND enodeb_id IS NOT NULL
+              AND cell_id IS NOT NULL
+            GROUP BY enodeb_id, cell_id, site_id
+        ) AS feed,
+        mba_sumbagut.ticket_service ts
+        WHERE ts.ticket_id = t.ticket_id
+          AND ts.end_day IS NULL
+          AND t.ticket_type = 'ZP'
+          AND t.enodeb_id = feed.enodeb_id
+          AND t.cell_id = feed.cell_id
+          AND t.site_id = feed.site_id
+    """, (today,))
+
+
+def _update_active_zt_aging(cur, today: date) -> None:
+    """Update aging for active ZT tickets from today's feed snapshot."""
+    cur.execute("""
+        UPDATE mba_sumbagut.ticket t
+        SET aging = COALESCE(feed.aging, 1)
+        FROM (
+            SELECT lac, ci, site_id, MAX(aging) AS aging
+            FROM mba_sumbagut.sri_zt_daily
+            WHERE "date" = %s
+              AND lac IS NOT NULL
+              AND ci IS NOT NULL
+            GROUP BY lac, ci, site_id
+        ) AS feed,
+        mba_sumbagut.ticket_service ts
+        WHERE ts.ticket_id = t.ticket_id
+          AND ts.end_day IS NULL
+          AND t.ticket_type = 'ZT'
+          AND t.lac = feed.lac
+          AND t.ci = feed.ci
+          AND t.site_id = feed.site_id
+    """, (today,))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SEED PIPELINE
 # Run once on first deploy (or to re-bootstrap after a gap).
@@ -446,28 +498,28 @@ def seed_pipeline() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # DAILY PIPELINE
 # Run every day after seeding.
-# Any cell that's been recurring already has an open ticket — it gets skipped
-# by the dedup check.  Only genuinely new cells reach the insert step, so
-# aging is always 1 here (no feed-table history lookup needed).
+# Any cell that's recurring already has an active ticket — its aging is updated
+# from the feed and it gets skipped by the dedup check. New cells use the
+# feed-provided aging when their ticket is inserted.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
     """
-    Daily ZP pass: create tickets (aging=1) for cells that are new today
-    and have no active open ticket.
+    Daily ZP pass: update active ticket aging, then create tickets for cells
+    that are new today and have no active open ticket.
     """
     log.info(f"[DAILY/ZP] Pass  today={today}")
+    _update_active_zp_aging(cur, today)
     cur.execute(_ZP_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for enodeb_id, cell_id, site_id, _feed_aging in rows:
+    for enodeb_id, cell_id, site_id, feed_aging in rows:
         try:
             district = resolve_district(cur, site_id)
-            # aging = 1: this cell has no open ticket, meaning it's a genuinely
-            # new problem.  If it had been recurring, the seed or a previous
-            # daily run would already have an open ticket for it.
+            # No active ticket means this is a new or recurring problem. Use the
+            # feed aging rather than resetting the problem age to one.
             params = ("ZP", enodeb_id, cell_id, None, None,
-                      site_id, district, today, 1)
+                      site_id, district, today, max(1, feed_aging or 1))
             tid = _insert_ticket_and_rca(cur, params, today)
             if tid:
                 created += 1
@@ -487,14 +539,15 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     Daily ZT pass: same logic using lac/ci.
     """
     log.info(f"[DAILY/ZT] Pass  today={today}")
+    _update_active_zt_aging(cur, today)
     cur.execute(_ZT_NEW_CELLS_SQL, (today,))
     rows = cur.fetchall()
     created = skipped = 0
-    for lac, ci, site_id, _feed_aging in rows:
+    for lac, ci, site_id, feed_aging in rows:
         try:
             district = resolve_district(cur, site_id)
             params = ("ZT", None, None, lac, ci,
-                      site_id, district, today, 1)
+                      site_id, district, today, max(1, feed_aging or 1))
             tid = _insert_ticket_and_rca(cur, params, today)
             if tid:
                 created += 1
@@ -509,7 +562,14 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     return created, skipped
 
 
-def _run_close_pass(cur, today: date, *, update_tracking: bool = True) -> int:
+def _run_close_pass(
+    cur,
+    today: date,
+    *,
+    update_tracking: bool = True,
+    close_zp: bool = True,
+    close_zt: bool = True,
+) -> int:
     """
     Close ticket_service rows where the problematic cell no longer appears
     in today's feed.  Minimum service duration = 1 day (feed is daily).
@@ -519,36 +579,40 @@ def _run_close_pass(cur, today: date, *, update_tracking: bool = True) -> int:
     closed_ids = []
 
     # ── Close ZP service tickets ─────────────────────────────────────────────
-    cur.execute("""
-        UPDATE mba_sumbagut.ticket_service ts
-        SET end_day = %s, updated_at = now()
-        FROM mba_sumbagut.ticket t
-        WHERE t.ticket_id = ts.ticket_id
-          AND ts.end_day IS NULL AND t.ticket_type = 'ZP'
-          AND NOT EXISTS (
-              SELECT 1 FROM mba_sumbagut.sri_zp_daily d
-              WHERE d."date" = %s AND d.enodeb_id = t.enodeb_id
-                AND d.cell_id = t.cell_id AND d.site_id = t.site_id
-          )
-        RETURNING ts.ticket_id
-    """, (today, today))
-    closed_ids.extend(row[0] for row in cur.fetchall())
+    # During a historical replay, only close a feed type when that day's
+    # snapshot exists.  A missing snapshot means "not loaded", not "cleared".
+    if close_zp:
+        cur.execute("""
+            UPDATE mba_sumbagut.ticket_service ts
+            SET end_day = %s, updated_at = now()
+            FROM mba_sumbagut.ticket t
+            WHERE t.ticket_id = ts.ticket_id
+              AND ts.end_day IS NULL AND t.ticket_type = 'ZP'
+              AND NOT EXISTS (
+                  SELECT 1 FROM mba_sumbagut.sri_zp_daily d
+                  WHERE d."date" = %s AND d.enodeb_id = t.enodeb_id
+                    AND d.cell_id = t.cell_id AND d.site_id = t.site_id
+              )
+            RETURNING ts.ticket_id
+        """, (today, today))
+        closed_ids.extend(row[0] for row in cur.fetchall())
 
     # ── Close ZT service tickets ─────────────────────────────────────────────
-    cur.execute("""
-        UPDATE mba_sumbagut.ticket_service ts
-        SET end_day = %s, updated_at = now()
-        FROM mba_sumbagut.ticket t
-        WHERE t.ticket_id = ts.ticket_id
-          AND ts.end_day IS NULL AND t.ticket_type = 'ZT'
-          AND NOT EXISTS (
-              SELECT 1 FROM mba_sumbagut.sri_zt_daily d
-              WHERE d."date" = %s AND d.lac = t.lac
-                AND d.ci = t.ci AND d.site_id = t.site_id
-          )
-        RETURNING ts.ticket_id
-    """, (today, today))
-    closed_ids.extend(row[0] for row in cur.fetchall())
+    if close_zt:
+        cur.execute("""
+            UPDATE mba_sumbagut.ticket_service ts
+            SET end_day = %s, updated_at = now()
+            FROM mba_sumbagut.ticket t
+            WHERE t.ticket_id = ts.ticket_id
+              AND ts.end_day IS NULL AND t.ticket_type = 'ZT'
+              AND NOT EXISTS (
+                  SELECT 1 FROM mba_sumbagut.sri_zt_daily d
+                  WHERE d."date" = %s AND d.lac = t.lac
+                    AND d.ci = t.ci AND d.site_id = t.site_id
+              )
+            RETURNING ts.ticket_id
+        """, (today, today))
+        closed_ids.extend(row[0] for row in cur.fetchall())
 
     if update_tracking:
         for ticket_id in closed_ids:
@@ -699,8 +763,116 @@ def daily_pipeline() -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def backfill_pipeline(start_date: date, end_date: date | None = None) -> None:
+    """Replay feed snapshots chronologically and create missing tickets.
+
+    A ticket is created on the first day its cell is present without an active
+    service row. If the cell disappears and later returns, the close pass ends
+    the old service phase and the next daily pass creates a new ticket. Missing
+    snapshots are skipped for that feed type so an ingestion gap cannot falsely
+    close tickets.
+    """
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                latest_dates = [
+                    get_feed_date(cur, "sri_zp_daily"),
+                    get_feed_date(cur, "sri_zt_daily"),
+                ]
+                latest_date = max((value for value in latest_dates if value is not None), default=None)
+                if latest_date is None:
+                    log.warning("No data in either feed table. Nothing to backfill.")
+                    return
+
+                if end_date is None:
+                    end_date = latest_date
+                if start_date > end_date:
+                    raise ValueError("Backfill start date must not be after end date")
+                if end_date > latest_date:
+                    raise ValueError(
+                        f"Backfill end date {end_date} is newer than the latest feed date {latest_date}"
+                    )
+
+                _ensure_service_rows(cur)
+                total_created = {"ZP": 0, "ZT": 0}
+                total_skipped = {"ZP": 0, "ZT": 0}
+                total_closed = 0
+                processed_days = 0
+
+                current = start_date
+                while current <= end_date:
+                    zp_loaded = feed_has_date(cur, "sri_zp_daily", current)
+                    zt_loaded = feed_has_date(cur, "sri_zt_daily", current)
+                    if not zp_loaded and not zt_loaded:
+                        log.warning("[BACKFILL] %s has no ZP or ZT snapshot; leaving state unchanged", current)
+                        current += timedelta(days=1)
+                        continue
+
+                    processed_days += 1
+                    log.info(
+                        "[BACKFILL] Processing %s (ZP=%s, ZT=%s)",
+                        current,
+                        "loaded" if zp_loaded else "missing",
+                        "loaded" if zt_loaded else "missing",
+                    )
+                    total_closed += _run_close_pass(
+                        cur,
+                        current,
+                        close_zp=zp_loaded,
+                        close_zt=zt_loaded,
+                    )
+
+                    if zp_loaded:
+                        created, skipped = _daily_zp_pass(cur, current)
+                        total_created["ZP"] += created
+                        total_skipped["ZP"] += skipped
+                    if zt_loaded:
+                        created, skipped = _daily_zt_pass(cur, current)
+                        total_created["ZT"] += created
+                        total_skipped["ZT"] += skipped
+
+                    current += timedelta(days=1)
+
+                refresh_tracking(cur)
+
+        log.info(
+            "BACKFILL complete: days=%s, ZP created=%s skipped=%s, "
+            "ZT created=%s skipped=%s, service closed=%s",
+            processed_days,
+            total_created["ZP"],
+            total_skipped["ZP"],
+            total_created["ZT"],
+            total_skipped["ZT"],
+            total_closed,
+        )
+    except Exception:
+        log.exception("BACKFILL failed - transaction rolled back")
+        raise
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    if "--seed" in sys.argv:
+    if "--backfill" in sys.argv:
+        try:
+            start_index = sys.argv.index("--start-date") + 1
+            start_date = date.fromisoformat(sys.argv[start_index])
+        except (ValueError, IndexError):
+            raise SystemExit(
+                "Usage: python dailypipeline.py --backfill "
+                "--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]"
+            )
+
+        end_date = None
+        if "--end-date" in sys.argv:
+            try:
+                end_index = sys.argv.index("--end-date") + 1
+                end_date = date.fromisoformat(sys.argv[end_index])
+            except (ValueError, IndexError):
+                raise SystemExit("--end-date must be in YYYY-MM-DD format")
+        backfill_pipeline(start_date, end_date)
+    elif "--seed" in sys.argv:
         seed_pipeline()
     else:
         daily_pipeline()

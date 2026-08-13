@@ -57,6 +57,22 @@ docker compose -f .\docker-compose.staging.yml up --build
 The Telegram bot remains a local process and should use its local staging
 `.env` with `API_BASE_URL=http://127.0.0.1:8000/api`.
 
+For historical ticket creation, use the backfill mode only after confirming
+that the staging database contains both feed snapshots from the requested
+start date onward. Unlike `--seed`, which bootstraps only from the latest
+available feed date, backfill processes each loaded calendar date in order and
+refreshes the tracking aggregates after the replay:
+
+```powershell
+Set-Location .\backend
+python .\dailypipeline.py --backfill --start-date 2026-06-01 --end-date 2026-08-13
+```
+
+Keep `ENABLE_PIPELINE=false` while running and validating the backfill. The
+command is transactional: an error rolls back the replay. A missing snapshot
+for one feed type is skipped for that type; it is not treated as a cleared
+problem.
+
 ### Production
 
 Copy the production example files to `.env.production` files, fill them from
