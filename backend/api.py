@@ -98,28 +98,6 @@ def get_db():
         conn.close()
 
 
-MOCK_ENGINEER_TICKETS = {
-    8887960178: {
-        "district": "DISTRICT-8887960178",
-        "tickets": [
-            {"ticket_id": 10001 + index, "ticket_type": "ZP", "site_id": f"MDN{index + 1:03d}",
-             "identifiers": {"enodeb_id": 41001 + index, "cell_id": index + 1},
-             "aging": 5 - index, "status": {"rca": False, "serviced": False}}
-            for index in range(5)
-        ],
-    },
-    8510386982: {
-        "district": "DISTRICT-8510386982",
-        "tickets": [
-            {"ticket_id": 10006 + index, "ticket_type": "ZT", "site_id": f"BJM{index + 1:03d}",
-             "identifiers": {"lac": 52001 + index, "ci": 62001 + index},
-             "aging": 5 - index, "status": {"rca": False, "serviced": False}}
-            for index in range(5)
-        ],
-    },
-}
-
-
 # ── Response / Request models ─────────────────────────────────────────────────
 
 class TicketStatus(BaseModel):
@@ -137,6 +115,50 @@ class Identifiers(BaseModel):
     cell_id:   Optional[int] = None
     lac:       Optional[int] = None
     ci:        Optional[int] = None
+
+
+class HistoryStatus(BaseModel):
+    code: str
+    rca_submitted: bool
+    service_closed: bool
+
+
+class HistoryRCA(BaseModel):
+    category_id: Optional[int] = None
+    category: Optional[str] = None
+    detail_id: Optional[int] = None
+    detail: Optional[str] = None
+    submitted_at: Optional[datetime] = None
+
+
+class HistoryService(BaseModel):
+    start_day: Optional[date] = None
+    end_day: Optional[date] = None
+
+
+class TicketHistoryOut(BaseModel):
+    ticket_id: int
+    ticket_type: str
+    created_date: date
+    resolved_date: Optional[date] = None
+    site_id: str
+    district: Optional[str] = None
+    identifiers: Identifiers
+    aging: int
+    site_class: str
+    status: HistoryStatus
+    rca: HistoryRCA
+    service: HistoryService
+    metrics: dict
+
+
+class TicketHistoryResponse(BaseModel):
+    district: str
+    tickets: list[TicketHistoryOut]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
 
 
 class TicketOut(BaseModel):
@@ -158,6 +180,11 @@ class TicketGroups(BaseModel):
 class TicketsResponse(BaseModel):
     district: str             # district_operation_do — bot uses this as the message header
     tickets: TicketGroups
+    page: int = 1
+    page_size: int = 10
+    total_need_service: int = 0
+    total_need_analysis: int = 0
+    total_pages: int = 1
 
 
 class IdentityResponse(BaseModel):
@@ -180,6 +207,35 @@ class TrackingSummaryOut(BaseModel):
 
 class TrackingSummariesResponse(BaseModel):
     districts: list[TrackingSummaryOut]
+
+
+class AnalyticsPoint(BaseModel):
+    date: date
+    total_tickets: int
+    active_tickets: int
+    closed_tickets: int
+    rca_completed: int
+    service_completed: int
+    avg_rca_response_days: Optional[float] = None
+    avg_service_response_days: Optional[float] = None
+
+
+class DistrictAnalytics(BaseModel):
+    district: str
+    total_tickets: int
+    active_tickets: int
+    closed_tickets: int
+    rca_completed: int
+    service_completed: int
+    avg_rca_response_days: Optional[float] = None
+    avg_service_response_days: Optional[float] = None
+    points: list[AnalyticsPoint]
+
+
+class ManagementAnalyticsResponse(BaseModel):
+    npo: str
+    days: int
+    districts: list[DistrictAnalytics]
 
 
 class TrackingDetailOut(BaseModel):
@@ -465,6 +521,97 @@ def get_management_districts(telegram_id: int, district_id: Optional[str] = None
         )
 
 
+def _weighted_average(points, value_key, count_key):
+    denominator = sum(getattr(point, count_key) for point in points)
+    if not denominator:
+        return None
+    numerator = sum(
+        getattr(point, value_key) * getattr(point, count_key)
+        for point in points
+        if getattr(point, value_key) is not None
+    )
+    return numerator / denominator
+
+
+@app.get(
+    "/api/management/analytics/{telegram_id}",
+    response_model=ManagementAnalyticsResponse,
+    summary="Manager district time-series analytics",
+)
+def get_management_analytics(
+    telegram_id: int,
+    district_id: Optional[str] = None,
+    days: int = 30,
+    conn=Depends(get_db),
+):
+    """Return ticket lifecycle and response-time analytics per district."""
+    if days < 7 or days > 60:
+        raise HTTPException(status_code=422, detail="days must be between 7 and 60.")
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        npo, selected_district = _resolve_manager_scope(cur, telegram_id, district_id)
+        cur.execute("""
+            SELECT DATE(t.created_date) AS day,
+                   mapping.district_operation_do AS district,
+                   COUNT(DISTINCT t.ticket_id) AS total_tickets,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE s.end_day IS NULL) AS active_tickets,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE s.end_day IS NOT NULL) AS closed_tickets,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE r.end_day IS NOT NULL) AS rca_completed,
+                   COUNT(DISTINCT t.ticket_id) FILTER (WHERE s.end_day IS NOT NULL) AS service_completed,
+                   AVG((r.end_day - t.created_date)::numeric)
+                       FILTER (WHERE r.end_day IS NOT NULL) AS avg_rca_response_days,
+                   AVG((s.end_day - s.start_day)::numeric)
+                       FILTER (WHERE s.end_day IS NOT NULL) AS avg_service_response_days
+            FROM mba_sumbagut.ticket t
+            JOIN sumatera.mapping_sysinfo_geohash mapping
+              ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+            LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+            WHERE mapping.departement_ns = %s
+              AND (%s IS NULL OR mapping.district_operation_do = %s)
+              AND t.created_date >= CURRENT_DATE - (%s - 1)
+            GROUP BY DATE(t.created_date), mapping.district_operation_do
+            ORDER BY mapping.district_operation_do, DATE(t.created_date)
+        """, (npo, selected_district, selected_district, days))
+        rows = cur.fetchall()
+        cur.execute("""
+            SELECT DISTINCT mapping.district_operation_do AS district
+            FROM sumatera.mapping_sysinfo_geohash mapping
+            WHERE mapping.region = 'SUMBAGUT'
+              AND mapping.departement_ns = %s
+              AND (%s IS NULL OR mapping.district_operation_do = %s)
+        """, (npo, selected_district, selected_district))
+        all_districts = [row["district"] or "UNASSIGNED" for row in cur.fetchall()]
+
+    grouped = {}
+    for district in all_districts:
+        grouped.setdefault(district, [])
+    for row in rows:
+        district = row["district"] or "UNASSIGNED"
+        grouped.setdefault(district, []).append(
+            AnalyticsPoint(**dict(row, date=row["day"]))
+        )
+    districts = [
+        DistrictAnalytics(
+            district=district,
+            total_tickets=sum(point.total_tickets for point in points),
+            active_tickets=sum(point.active_tickets for point in points),
+            closed_tickets=sum(point.closed_tickets for point in points),
+            rca_completed=sum(point.rca_completed for point in points),
+            service_completed=sum(point.service_completed for point in points),
+            avg_rca_response_days=_weighted_average(
+                points, "avg_rca_response_days", "rca_completed"
+            ),
+            avg_service_response_days=_weighted_average(
+                points, "avg_service_response_days", "service_completed"
+            ),
+            points=points,
+        )
+        for district, points in grouped.items()
+    ]
+    districts.sort(key=lambda item: (-item.total_tickets, item.district))
+    return ManagementAnalyticsResponse(npo=npo, days=days, districts=districts)
+
+
 @app.get("/api/management/recap/{telegram_id}", response_model=TrackingSummaryOut, summary="Manager district recap")
 def get_management_recap(telegram_id: int, district_id: Optional[str] = None, conn=Depends(get_db)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -625,20 +772,212 @@ def get_engineers(conn=Depends(get_db)):
         }
 
 
+def _history_ticket(row):
+    """Convert one joined lifecycle row into the public history shape."""
+    identifiers = Identifiers(
+        enodeb_id=row["enodeb_id"] if row["ticket_type"] == "ZP" else None,
+        cell_id=row["cell_id"] if row["ticket_type"] == "ZP" else None,
+        lac=row["lac"] if row["ticket_type"] == "ZT" else None,
+        ci=row["ci"] if row["ticket_type"] == "ZT" else None,
+    )
+    rca_submitted = row["submitted_at"] is not None
+    service_closed = row["service_end_day"] is not None
+    if not rca_submitted:
+        status_code = "need_analysis"
+    elif not service_closed:
+        status_code = "need_service"
+    else:
+        status_code = "resolved"
+    rca_days = None
+    if row["submitted_at"] is not None:
+        rca_days = (row["submitted_at"].date() - row["created_date"]).days
+    service_days = None
+    if row["service_start_day"] is not None and row["service_end_day"] is not None:
+        service_days = (row["service_end_day"] - row["service_start_day"]).days
+    return TicketHistoryOut(
+        ticket_id=row["ticket_id"],
+        ticket_type=row["ticket_type"],
+        created_date=row["created_date"],
+        resolved_date=row["service_end_day"],
+        site_id=row["site_id"],
+        district=row["district"],
+        identifiers=identifiers,
+        aging=row["aging"],
+        site_class=row["site_class"],
+        status=HistoryStatus(
+            code=status_code,
+            rca_submitted=rca_submitted,
+            service_closed=service_closed,
+        ),
+        rca=HistoryRCA(
+            category_id=row["rca_id"],
+            category=row["rca_name"],
+            detail_id=row["rca_detail_id"],
+            detail=row["rca_detail_name"],
+            submitted_at=row["submitted_at"],
+        ),
+        service=HistoryService(
+            start_day=row["service_start_day"],
+            end_day=row["service_end_day"],
+        ),
+        metrics={
+            "rca_resolution_days": rca_days,
+            "service_resolution_days": service_days,
+        },
+    )
+
+
+def _history_scope(role, npo, district_id):
+    """Return the scope predicate and its parameter tuple."""
+    if role == "manager":
+        return (
+            "mapping.departement_ns = %s AND (%s IS NULL OR mapping.district_operation_do = %s)",
+            (npo, district_id, district_id),
+        )
+    return ("t.district_operation_do = %s", (district_id,))
+
+
+def _history_base_sql(scope_sql):
+    return f"""
+        SELECT t.ticket_id, t.ticket_type, t.created_date, t.site_id,
+               t.district_operation_do AS ticket_district,
+               t.enodeb_id, t.cell_id, t.lac, t.ci, t.aging,
+               COALESCE(mapping.district_operation_do, t.district_operation_do) AS district,
+               COALESCE(mapping.class, 'unknown') AS site_class,
+               r.rca_id, r.rca_detail_id, r.submitted_at,
+               rc.name AS rca_name, rd.name AS rca_detail_name,
+               s.start_day AS service_start_day, s.end_day AS service_end_day,
+               CASE WHEN r.submitted_at IS NULL THEN 'need_analysis'
+                    WHEN s.end_day IS NULL THEN 'need_service'
+                    ELSE 'resolved' END AS lifecycle_status
+        FROM mba_sumbagut.ticket t
+        LEFT JOIN sumatera.mapping_sysinfo_geohash mapping
+          ON mapping.site_id = t.site_id AND mapping.region = 'SUMBAGUT'
+        LEFT JOIN mba_sumbagut.ticket_rca r ON r.ticket_id = t.ticket_id
+        LEFT JOIN mba_sumbagut.rca rc ON rc.rca_id = r.rca_id
+        LEFT JOIN mba_sumbagut.rca_detail rd
+          ON rd.rca_detail_id = r.rca_detail_id AND rd.rca_id = r.rca_id
+        LEFT JOIN mba_sumbagut.ticket_service s ON s.ticket_id = t.ticket_id
+        WHERE {scope_sql}
+    """
+
+
 @app.get(
-    "/api/mock/engineers/{telegram_id}/tickets",
-    response_model=None,
-    summary="Five mock tickets assigned to an engineer",
+    "/api/tickets/{telegram_id}/history",
+    response_model=TicketHistoryResponse,
+    summary="Historical tickets within the caller's scope",
 )
-def get_mock_engineer_tickets(telegram_id: int):
-    """Temporary ticket assignment used to test Telegram notifications."""
-    assignment = MOCK_ENGINEER_TICKETS.get(telegram_id)
-    if assignment is None:
-        raise HTTPException(status_code=404, detail=f"Engineer {telegram_id} not found.")
-    return {
-        "district": assignment["district"],
-        "tickets": assignment["tickets"],
-    }
+def get_ticket_history(
+    telegram_id: int,
+    status: str = "all",
+    district_id: Optional[str] = None,
+    as_role: Optional[str] = None,
+    site_id: Optional[str] = None,
+    ticket_type: Optional[str] = None,
+    rca_id: Optional[int] = None,
+    created_from: Optional[date] = None,
+    created_to: Optional[date] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
+    sort: str = "created_date",
+    order: str = "desc",
+    conn=Depends(get_db),
+):
+    if status not in {"all", "resolved", "need_analysis", "need_service"}:
+        raise HTTPException(status_code=422, detail="status must be all, resolved, need_analysis, or need_service.")
+    if ticket_type is not None and ticket_type not in {"ZP", "ZT"}:
+        raise HTTPException(status_code=422, detail="ticket_type must be ZP or ZT.")
+    if page < 1 or page_size < 1 or page_size > 50:
+        raise HTTPException(status_code=422, detail="page must be >= 1 and page_size must be between 1 and 50.")
+    if created_from and created_to and created_from > created_to:
+        raise HTTPException(status_code=422, detail="created_from cannot be after created_to.")
+    if sort not in {"created_date", "aging", "ticket_id", "resolved_date"} or order not in {"asc", "desc"}:
+        raise HTTPException(status_code=422, detail="Invalid sort or order.")
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        requested_role = as_role if as_role in {"manager", "engineer"} else None
+        cur.execute("SELECT DISTINCT role FROM mba_sumbagut.telegram_district_role WHERE telegram_id = %s", (telegram_id,))
+        roles = {row["role"] for row in cur.fetchall()}
+        if requested_role == "manager" or roles == {"manager"}:
+            npo, selected_district = _resolve_manager_scope(cur, telegram_id, district_id)
+            role, scope_district = "manager", selected_district
+        else:
+            role, scope_district = _resolve_assignment(cur, telegram_id, requested_role, district_id)
+            npo = None
+        scope_sql, params = _history_scope(role, npo, scope_district)
+        filters = []
+        filter_params = []
+        if status != "all":
+            filters.append("lifecycle_status = %s")
+            filter_params.append(status)
+        if site_id:
+            filters.append("site_id = %s")
+            filter_params.append(site_id)
+        if ticket_type:
+            filters.append("ticket_type = %s")
+            filter_params.append(ticket_type)
+        if rca_id is not None:
+            filters.append("rca_id = %s")
+            filter_params.append(rca_id)
+        if created_from:
+            filters.append("created_date >= %s")
+            filter_params.append(created_from)
+        if created_to:
+            filters.append("created_date <= %s")
+            filter_params.append(created_to)
+        if search:
+            filters.append("(CAST(ticket_id AS text) ILIKE %s OR site_id ILIKE %s OR CAST(enodeb_id AS text) ILIKE %s OR CAST(cell_id AS text) ILIKE %s OR CAST(lac AS text) ILIKE %s OR CAST(ci AS text) ILIKE %s)")
+            filter_params.extend([f"%{search}%"] * 6)
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        base = _history_base_sql(scope_sql)
+        cur.execute(f"SELECT COUNT(*) AS total FROM ({base}) history {where}", params + filter_params)
+        total = cur.fetchone()["total"]
+        sort_column = {"created_date": "created_date", "aging": "aging", "ticket_id": "ticket_id", "resolved_date": "service_end_day"}[sort]
+        cur.execute(
+            f"SELECT * FROM ({base}) history {where} ORDER BY {sort_column} {order.upper()} NULLS LAST, ticket_id DESC LIMIT %s OFFSET %s",
+            params + filter_params + [page_size, (page - 1) * page_size],
+        )
+        rows = cur.fetchall()
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if page > total_pages:
+        raise HTTPException(status_code=404, detail="Ticket history page not found.")
+    return TicketHistoryResponse(
+        district=scope_district or npo,
+        tickets=[_history_ticket(row) for row in rows],
+        page=page,
+        page_size=page_size,
+        total=total,
+        total_pages=total_pages,
+    )
+
+
+@app.get(
+    "/api/tickets/{telegram_id}/history/{ticket_id}",
+    response_model=TicketHistoryOut,
+    summary="Historical ticket detail within the caller's scope",
+)
+def get_ticket_history_detail(telegram_id: int, ticket_id: int, district_id: Optional[str] = None, as_role: Optional[str] = None, conn=Depends(get_db)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT DISTINCT role FROM mba_sumbagut.telegram_district_role WHERE telegram_id = %s", (telegram_id,))
+        roles = {row["role"] for row in cur.fetchall()}
+        requested_role = as_role if as_role in {"manager", "engineer"} else None
+        if requested_role == "manager" or roles == {"manager"}:
+            npo, selected_district = _resolve_manager_scope(cur, telegram_id, district_id)
+            role, scope_district = "manager", selected_district
+        else:
+            role, scope_district = _resolve_assignment(cur, telegram_id, requested_role, district_id)
+            npo = None
+        scope_sql, scope_params = _history_scope(role, npo, scope_district)
+        cur.execute(
+            f"SELECT * FROM ({_history_base_sql(scope_sql)}) history WHERE ticket_id = %s",
+            scope_params + (ticket_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Ticket not found in the caller's scope.")
+    return _history_ticket(row)
 
 
 # ── GET /api/tickets/{telegram_id} ───────────────────────────────────────────
@@ -652,6 +991,8 @@ def get_tickets(
     telegram_id: int,
     district_id: Optional[str] = None,
     as_role: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
     conn=Depends(get_db),
 ):
     """
@@ -661,6 +1002,9 @@ def get_tickets(
     Note: `serviced=true` tickets are included for now.
     Once the system is stable, filter them out here.
     """
+    if page < 1 or page_size < 1 or page_size > 50:
+        raise HTTPException(status_code=422, detail="page must be >= 1 and page_size must be between 1 and 50.")
+
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         requested_role = as_role if as_role in {"engineer", "manager"} else None
         if requested_role == "manager":
@@ -744,12 +1088,26 @@ def get_tickets(
 
     need_service.sort(key=priority_order)
     need_analysis.sort(key=priority_order)
+    total_need_service = len(need_service)
+    total_need_analysis = len(need_analysis)
+    total_pages = max(
+        1,
+        (max(total_need_service, total_need_analysis) + page_size - 1) // page_size,
+    )
+    if page > total_pages:
+        raise HTTPException(status_code=404, detail="Ticket page not found.")
+    start = (page - 1) * page_size
     return TicketsResponse(
         district=district_id,
         tickets=TicketGroups(
-            need_service=[ticket for _, ticket in need_service],
-            need_analysis=[ticket for _, ticket in need_analysis],
+            need_service=[ticket for _, ticket in need_service[start:start + page_size]],
+            need_analysis=[ticket for _, ticket in need_analysis[start:start + page_size]],
         ),
+        page=page,
+        page_size=page_size,
+        total_need_service=total_need_service,
+        total_need_analysis=total_need_analysis,
+        total_pages=total_pages,
     )
 
 

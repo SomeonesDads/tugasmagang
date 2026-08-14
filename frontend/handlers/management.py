@@ -5,6 +5,7 @@ from telegram.ext import ContextTypes
 
 from api_client import (
     BackendAPIError,
+    get_management_analytics,
     get_management_districts,
     get_management_details,
     get_management_recap,
@@ -13,10 +14,11 @@ from api_client import (
 )
 
 
-DISTRICT_MENU = [["Select District"], ["Active Tickets"]]
-SELECTED_DISTRICT_MENU = [["More Info", "Site Info"], ["Active Tickets"], ["All Districts"]]
+DISTRICT_MENU = [["Select District"], ["Graph View"], ["Active Tickets"], ["Ticket History"]]
+SELECTED_DISTRICT_MENU = [["More Info", "Site Info"], ["Active Tickets", "Ticket History"], ["All Districts"]]
 SITE_MENU = [["More Info", "District Info"], ["Active Tickets"]]
 BACK_MENU = [["Back"]]
+GRAPH_PERIOD_MENU = [["7 days", "30 days"], ["2 months"], ["Back"]]
 
 
 def _district_menu():
@@ -85,6 +87,13 @@ async def show_manager_dashboard(update: Update, context: ContextTypes.DEFAULT_T
 
 async def prompt_for_district(update, context):
     districts = context.user_data.get("manager_districts", [])
+    if not districts:
+        await update.effective_message.reply_text(
+            "Tidak ada district untuk dipilih.",
+            reply_markup=_district_menu(),
+        )
+        return
+
     choices = "\n".join(
         f"{number}. {summary['district']}"
         for number, summary in enumerate(districts, start=1)
@@ -93,6 +102,53 @@ async def prompt_for_district(update, context):
     await update.effective_message.reply_text(
         "Pilih district dengan membalas nomornya:\n\n" + choices,
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def prompt_for_graph_period(update, context):
+    context.user_data["manager_waiting_graph_period"] = True
+    await update.effective_message.reply_text(
+        "Pilih periode Graph View:",
+        reply_markup=ReplyKeyboardMarkup(
+            GRAPH_PERIOD_MENU, resize_keyboard=True, one_time_keyboard=False,
+        ),
+    )
+
+
+async def show_manager_graph(update, context, days):
+    """Send lifecycle counts and response-time comparison for the manager's NPO."""
+    try:
+        from graph_view import build_manager_analytics_chart
+    except ImportError:
+        await update.effective_message.reply_text(
+            "Graph View membutuhkan matplotlib. Jalankan: pip install -r requirements.txt"
+        )
+        return
+
+    try:
+        payload = await get_management_analytics(
+            update.effective_user.id,
+            context.user_data.get("admin_view_district"),
+            days=days,
+        )
+    except BackendAPIError as exc:
+        await update.effective_message.reply_text(f"Error: {exc}")
+        return
+
+    chart = build_manager_analytics_chart(payload)
+    if chart is None:
+        await update.effective_message.reply_text("Belum ada data historis untuk grafik.", reply_markup=_district_menu())
+        return
+
+    context.user_data["manager_screen"] = "analytics"
+    await update.effective_message.reply_photo(
+        photo=chart,
+        caption=(
+            f"GRAPH VIEW — {days} hari terakhir\n"
+            "Active/closed, RCA-completed, service-completed, dan response time per district.\n"
+            "Response time dihitung dalam hari; semakin rendah semakin cepat."
+        ),
+        reply_markup=_district_menu(),
     )
 
 
@@ -238,6 +294,24 @@ async def process_manager_input(update, context):
     """Route only manager navigation; ticket and RCA input is never enabled here."""
     message = update.message.text.strip() if update.message else ""
 
+    if context.user_data.get("history_screen") or context.user_data.get("history_waiting"):
+        from handlers.history import process_history_input
+        await process_history_input(update, context)
+        return
+
+    if context.user_data.get("manager_waiting_graph_period"):
+        if message == "Back":
+            context.user_data["manager_waiting_graph_period"] = False
+            await show_manager_dashboard(update, context)
+            return
+        periods = {"7 days": 7, "30 days": 30, "2 months": 60}
+        if message not in periods:
+            await update.message.reply_text("Pilih 7 days, 30 days, atau 2 months.")
+            return
+        context.user_data["manager_waiting_graph_period"] = False
+        await show_manager_graph(update, context, periods[message])
+        return
+
     if context.user_data.get("manager_waiting_site"):
         if not message.isdigit():
             await update.message.reply_text("Masukkan nomor site.")
@@ -267,6 +341,9 @@ async def process_manager_input(update, context):
     if message == "Select District":
         await prompt_for_district(update, context)
         return
+    if message == "Graph View":
+        await prompt_for_graph_period(update, context)
+        return
     if message == "More Info":
         if screen == "district":
             await show_manager_details(update, context)
@@ -287,3 +364,8 @@ async def process_manager_input(update, context):
         await show_manager_sites(update, context)
     elif message == "Active Tickets":
         await show_manager_tickets(update, context)
+    elif message == "Ticket History":
+        context.user_data["ticket_view_role"] = "manager"
+        context.user_data["ticket_view_district"] = _district(context)
+        from handlers.history import show_history_filters
+        await show_history_filters(update, context, reset=True)
