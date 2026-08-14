@@ -172,6 +172,8 @@ CREATE INDEX idx_ticket_rca_open ON mba_sumbagut.ticket_rca (ticket_id)
 -- Fast lookup for tickets awaiting service (RCA done, service not yet opened)
 CREATE INDEX idx_ticket_rca_pending_svc ON mba_sumbagut.ticket_rca (end_day)
     WHERE end_day IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ticket_rca_submitted_at
+    ON mba_sumbagut.ticket_rca (submitted_at);
 
 
 --  mba_sumbagut.ticket_service 
@@ -199,6 +201,8 @@ CREATE TABLE mba_sumbagut.ticket_service (
 -- Fast lookup for open service tickets (checked daily by pipeline)
 CREATE INDEX idx_ticket_service_open ON mba_sumbagut.ticket_service (ticket_id)
     WHERE end_day IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ticket_service_end_day
+    ON mba_sumbagut.ticket_service (end_day);
 
 
 -- ============================================================
