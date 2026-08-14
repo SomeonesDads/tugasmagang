@@ -31,6 +31,7 @@ def management_menu():
 
 def engineer_menu():
     keyboard = [
+        ["Ticket History"],
         ["🎫 View Ticket"],
         ["⬅️ Kembali"],
     ]

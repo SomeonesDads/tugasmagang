@@ -1,8 +1,41 @@
 from datetime import datetime
 
-from telegram import ReplyKeyboardRemove
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 from api_client import BackendAPIError, get_rca_options, get_tickets
+
+
+TELEGRAM_MESSAGE_LIMIT = 4096
+TICKETS_PER_PAGE = 10
+
+
+async def _reply_long_message(message, text, **kwargs):
+    """Send text in Telegram-safe chunks while preserving markup on the last one."""
+    lines = text.splitlines(keepends=True)
+    chunks = []
+    current = ""
+
+    for line in lines:
+        if len(line) > TELEGRAM_MESSAGE_LIMIT:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(
+                line[index:index + TELEGRAM_MESSAGE_LIMIT]
+                for index in range(0, len(line), TELEGRAM_MESSAGE_LIMIT)
+            )
+        elif len(current) + len(line) > TELEGRAM_MESSAGE_LIMIT:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+
+    if current or not chunks:
+        chunks.append(current)
+
+    for index, chunk in enumerate(chunks):
+        reply_kwargs = kwargs if index == len(chunks) - 1 else {}
+        await message.reply_text(chunk, **reply_kwargs)
 
 
 def _ticket_label(ticket):
@@ -33,13 +66,16 @@ def _ticket_status(ticket):
     return f"Serviced: {serviced}"
 
 
-async def show_ticket_dashboard(update, context, interactive=True):
+async def show_ticket_dashboard(update, context, interactive=True, page=0):
+    message = update.effective_message
     try:
         telegram_id = update.effective_user.id
         payload = await get_tickets(
             telegram_id,
             district_id=context.user_data.get("ticket_view_district"),
             as_role=context.user_data.get("ticket_view_role"),
+            page=page + 1,
+            page_size=TICKETS_PER_PAGE,
         )
     except BackendAPIError as exc:
         await update.message.reply_text(f"❌ {exc}")
@@ -75,18 +111,48 @@ async def show_ticket_dashboard(update, context, interactive=True):
             text += f"- {_ticket_label(ticket)}\nAging: {ticket['aging']} hari | Class: {_site_class(ticket)}\n\n"
 
     text += "Need Analyzing\n\n"
+    page_count = payload.get("total_pages", 1)
+    page = max(0, min(page, page_count - 1))
+    page_tickets = need_analyzing
     if not need_analyzing:
         text += "Tidak ada tiket."
     else:
-        for number, ticket in enumerate(need_analyzing, start=1):
+        for number, ticket in enumerate(page_tickets, start=1):
             text += f"{number}. {_ticket_label(ticket)}\nAging: {ticket['aging']} hari | Class: {_site_class(ticket)} | {_ticket_status(ticket)} \n\n"
-            if interactive:
-                context.user_data["ticket_list"].append(ticket)
         if interactive:
-            text += "Balas dengan nomor tiket yang ingin diproses."
+            text += f"Halaman {page + 1}/{page_count}. Balas dengan nomor tiket pada halaman ini."
 
     context.user_data["waiting_ticket"] = interactive and bool(need_analyzing)
-    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    context.user_data["ticket_list"] = page_tickets
+    keyboard = []
+    context.user_data["ticket_dashboard_interactive"] = interactive
+    if page_count > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("Sebelumnya", callback_data=f"ticket_page:{page - 1}"))
+        if page < page_count - 1:
+            navigation.append(InlineKeyboardButton("Berikutnya", callback_data=f"ticket_page:{page + 1}"))
+        keyboard.append(navigation)
+    await _reply_long_message(
+        message,
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else ReplyKeyboardRemove(),
+    )
+
+
+async def paginate_ticket_dashboard(update, context):
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = int(query.data.split(":", 1)[1])
+    except (AttributeError, IndexError, ValueError):
+        return
+    await show_ticket_dashboard(
+        update,
+        context,
+        interactive=context.user_data.get("ticket_dashboard_interactive", True),
+        page=page,
+    )
 
 
 async def select_ticket(update, context):
@@ -143,9 +209,16 @@ async def process_text_input(update, context):
     so this single router is required instead of three overlapping TEXT
     handlers.
     """
-    if context.user_data.get("admin_setup_step"):
+    if update.message and update.message.text.strip() == "Ticket History" and not context.user_data.get("manager_mode"):
+        context.user_data["ticket_view_role"] = "engineer"
+        from handlers.history import show_history_filters
+        await show_history_filters(update, context, reset=True)
+    elif context.user_data.get("admin_setup_step"):
         from handlers.start import process_admin_setup
         await process_admin_setup(update, context)
+    elif context.user_data.get("history_screen") or context.user_data.get("history_waiting"):
+        from handlers.history import process_history_input
+        await process_history_input(update, context)
     elif context.user_data.get("manager_mode"):
         from handlers.management import process_manager_input
         await process_manager_input(update, context)

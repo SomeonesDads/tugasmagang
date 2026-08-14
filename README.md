@@ -61,17 +61,19 @@ For historical ticket creation, use the backfill mode only after confirming
 that the staging database contains both feed snapshots from the requested
 start date onward. Unlike `--seed`, which bootstraps only from the latest
 available feed date, backfill processes each loaded calendar date in order and
-refreshes the tracking aggregates after the replay:
+refreshes the tracking aggregates after the replay. Before a large replay, run
+the one-time indexes in `backend/backfill_performance_migration.sql`.
 
 ```powershell
 Set-Location .\backend
 python .\dailypipeline.py --backfill --start-date 2026-06-01 --end-date 2026-08-13
 ```
 
-Keep `ENABLE_PIPELINE=false` while running and validating the backfill. The
-command is transactional: an error rolls back the replay. A missing snapshot
-for one feed type is skipped for that type; it is not treated as a cleared
-problem.
+Keep `ENABLE_PIPELINE=false` while running and validating the backfill. Each
+loaded calendar date is committed independently: if a day fails, that day is
+rolled back while prior days remain committed, so rerunning the same date range
+is safe and resumable. A missing snapshot for one feed type is skipped for that
+type; it is not treated as a cleared problem.
 
 ### Production
 
@@ -91,8 +93,10 @@ from infrastructure before deployment.
 
 Panduan ini menjalankan backend FastAPI serta bot Telegram secara lokal di
 Windows/PowerShell. Bot membaca tiket dari backend dan command
-`/notify_engineers` mengirim lima tiket mock ke masing-masing engineer:
-`8887960178` dan `8510386982`.
+`/notify_engineers` mengirim antrean tiket aktif terbaru ke setiap engineer.
+Bot juga mengirimkan antrean tersebut otomatis setiap hari pada waktu yang
+ditentukan oleh `DAILY_BROADCAST_TIME` (default `08:00`, zona waktu
+`Asia/Jakarta`).
 
 ## 1. Siapkan Python environment
 
@@ -124,10 +128,10 @@ Isi `frontend/.env` seperti berikut:
 ```env
 TELEGRAM_BOT_TOKEN=token_baru_dari_botfather
 API_BASE_URL=http://127.0.0.1:8000/api
-ENGINEER_DISTRICT=DISTRICT-8887960178
+DAILY_BROADCAST_TIME=08:00
+DAILY_BROADCAST_TIMEZONE=Asia/Jakarta
 ```
 
-`ENGINEER_DISTRICT` dipakai untuk memilih district saat mengirim notifikasi.
 Menu **View Ticket** sekarang mengirimkan Telegram ID pengguna ke backend; the
 backend resolves that engineer's district from `telegram_district_role`.
 
@@ -157,12 +161,30 @@ python .\seed_rca.py
 The command is safe to rerun. The bot reads RCA categories and details through
 `GET /api/rca-options`; it does not contain local dummy RCA data.
 
-Untuk memastikan data mock tersedia, dari terminal lain jalankan:
+Untuk memastikan endpoint engineer dan tiket tersedia, dari terminal lain jalankan:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/engineers/DISTRICT-8887960178
 Invoke-RestMethod http://127.0.0.1:8000/api/tickets/8887960178
-Invoke-RestMethod http://127.0.0.1:8000/api/mock/engineers/8887960178/tickets
+
+### Ticket history
+
+Ticket history is a read-only view of the complete ticket lifecycle. Engineers
+open `Ticket History` for their assigned district; managers open it after
+selecting a district and see the permitted NPO scope. History supports status
+(`all`, `resolved`, `need_analysis`, `need_service`), site, ticket type, RCA
+category, creation-date range, search, sorting, and pagination.
+
+```text
+GET /api/tickets/{telegram_id}/history?status=resolved&page=1&page_size=10
+GET /api/tickets/{telegram_id}/history/{ticket_id}
+```
+
+Lifecycle statuses are derived from the existing RCA and service rows:
+`need_analysis` means RCA has not been submitted, `need_service` means RCA is
+submitted but service is still open, and `resolved` means both RCA and service
+are complete. `active` is the combined label for the first two states.
+History detail is read-only and includes RCA/service dates and durations.
 ```
 
 Engineer routing rows can be added directly after migrating the schema:
@@ -194,7 +216,7 @@ Biarkan kedua terminal tetap berjalan selama pengujian.
    engineer (`8887960178` dan `8510386982`). Ini wajib dilakukan sekali agar
    Telegram mengizinkan bot mengirim pesan ke mereka.
 3. Dari chat bot mana pun, kirim `/notify_engineers`.
-4. Kedua engineer akan menerima pesan penugasan berisi lima tiket mock. Mereka
+4. Kedua engineer akan menerima antrean tiket aktif dari district mereka. Mereka
    dapat memilih **Engineer Field** → **View Ticket** untuk melihat dan mengisi
    RCA pada tiket yang ditampilkan.
 
