@@ -91,6 +91,26 @@ def resolve_district(cur, site_id: str) -> str | None:
     return row[0] if row else None
 
 
+def load_districts(cur) -> dict[str, str | None]:
+    """Load the latest known district mapping once for a pipeline run."""
+    cur.execute("""
+        SELECT DISTINCT ON (sr.site_id) sr.site_id, sr.district_operation_do
+        FROM mba_sumbagut.site_reference sr
+        JOIN mba_sumbagut.pipeline_runs pr
+          ON pr.pipeline_run_id = sr.pipeline_run_id
+        WHERE sr.site_id IS NOT NULL
+        ORDER BY sr.site_id, pr.started_at DESC
+    """)
+    return {site_id: district for site_id, district in cur.fetchall()}
+
+
+def district_for_site(cur, site_id: str, district_cache: dict[str, str | None] | None) -> str | None:
+    """Resolve a site district, using the run cache when available."""
+    if district_cache is not None:
+        return district_cache.get(site_id)
+    return resolve_district(cur, site_id)
+
+
 def _tracking_add_ticket(cur, ticket_id: int) -> None:
     """Increment total-ticket tracking for a newly created ticket."""
     cur.execute("""
@@ -503,7 +523,13 @@ def seed_pipeline() -> None:
 # feed-provided aging when their ticket is inserted.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
+def _daily_zp_pass(
+    cur,
+    today: date,
+    *,
+    update_tracking: bool = True,
+    district_cache: dict[str, str | None] | None = None,
+) -> tuple[int, int]:
     """
     Daily ZP pass: update active ticket aging, then create tickets for cells
     that are new today and have no active open ticket.
@@ -515,12 +541,12 @@ def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
     created = skipped = 0
     for enodeb_id, cell_id, site_id, feed_aging in rows:
         try:
-            district = resolve_district(cur, site_id)
+            district = district_for_site(cur, site_id, district_cache)
             # No active ticket means this is a new or recurring problem. Use the
             # feed aging rather than resetting the problem age to one.
             params = ("ZP", enodeb_id, cell_id, None, None,
                       site_id, district, today, max(1, feed_aging or 1))
-            tid = _insert_ticket_and_rca(cur, params, today)
+            tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
             if tid:
                 created += 1
                 log.debug(f"  [DAILY/ZP] #{tid}  enodeb={enodeb_id}  cell={cell_id}  site={site_id}")
@@ -534,7 +560,13 @@ def _daily_zp_pass(cur, today: date) -> tuple[int, int]:
     return created, skipped
 
 
-def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
+def _daily_zt_pass(
+    cur,
+    today: date,
+    *,
+    update_tracking: bool = True,
+    district_cache: dict[str, str | None] | None = None,
+) -> tuple[int, int]:
     """
     Daily ZT pass: same logic using lac/ci.
     """
@@ -545,10 +577,10 @@ def _daily_zt_pass(cur, today: date) -> tuple[int, int]:
     created = skipped = 0
     for lac, ci, site_id, feed_aging in rows:
         try:
-            district = resolve_district(cur, site_id)
+            district = district_for_site(cur, site_id, district_cache)
             params = ("ZT", None, None, lac, ci,
                       site_id, district, today, max(1, feed_aging or 1))
-            tid = _insert_ticket_and_rca(cur, params, today)
+            tid = _insert_ticket_and_rca(cur, params, today, update_tracking=update_tracking)
             if tid:
                 created += 1
                 log.debug(f"  [DAILY/ZT] #{tid}  lac={lac}  ci={ci}  site={site_id}")
@@ -774,67 +806,85 @@ def backfill_pipeline(start_date: date, end_date: date | None = None) -> None:
     """
     conn = get_connection()
     try:
-        with conn:
-            with conn.cursor() as cur:
-                latest_dates = [
-                    get_feed_date(cur, "sri_zp_daily"),
-                    get_feed_date(cur, "sri_zt_daily"),
-                ]
-                latest_date = max((value for value in latest_dates if value is not None), default=None)
-                if latest_date is None:
-                    log.warning("No data in either feed table. Nothing to backfill.")
-                    return
+        with conn.cursor() as cur:
+            latest_dates = [
+                get_feed_date(cur, "sri_zp_daily"),
+                get_feed_date(cur, "sri_zt_daily"),
+            ]
+            latest_date = max((value for value in latest_dates if value is not None), default=None)
+            if latest_date is None:
+                log.warning("No data in either feed table. Nothing to backfill.")
+                return
 
-                if end_date is None:
-                    end_date = latest_date
-                if start_date > end_date:
-                    raise ValueError("Backfill start date must not be after end date")
-                if end_date > latest_date:
-                    raise ValueError(
-                        f"Backfill end date {end_date} is newer than the latest feed date {latest_date}"
-                    )
+            if end_date is None:
+                end_date = latest_date
+            if start_date > end_date:
+                raise ValueError("Backfill start date must not be after end date")
+            if end_date > latest_date:
+                raise ValueError(
+                    f"Backfill end date {end_date} is newer than the latest feed date {latest_date}"
+                )
 
-                _ensure_service_rows(cur)
-                total_created = {"ZP": 0, "ZT": 0}
-                total_skipped = {"ZP": 0, "ZT": 0}
-                total_closed = 0
-                processed_days = 0
+            _ensure_service_rows(cur)
+            # Backfill tracking is rebuilt once after the replay. Updating
+            # aggregates for every ticket adds several round trips per row.
+            district_cache = load_districts(cur)
+            conn.commit()
+            total_created = {"ZP": 0, "ZT": 0}
+            total_skipped = {"ZP": 0, "ZT": 0}
+            total_closed = 0
+            processed_days = 0
 
-                current = start_date
-                while current <= end_date:
-                    zp_loaded = feed_has_date(cur, "sri_zp_daily", current)
-                    zt_loaded = feed_has_date(cur, "sri_zt_daily", current)
-                    if not zp_loaded and not zt_loaded:
-                        log.warning("[BACKFILL] %s has no ZP or ZT snapshot; leaving state unchanged", current)
-                        current += timedelta(days=1)
-                        continue
+            current = start_date
+            while current <= end_date:
+                zp_loaded = feed_has_date(cur, "sri_zp_daily", current)
+                zt_loaded = feed_has_date(cur, "sri_zt_daily", current)
+                if not zp_loaded and not zt_loaded:
+                    log.warning("[BACKFILL] %s has no ZP or ZT snapshot; leaving state unchanged", current)
+                    current += timedelta(days=1)
+                    continue
 
-                    processed_days += 1
-                    log.info(
-                        "[BACKFILL] Processing %s (ZP=%s, ZT=%s)",
-                        current,
-                        "loaded" if zp_loaded else "missing",
-                        "loaded" if zt_loaded else "missing",
-                    )
-                    total_closed += _run_close_pass(
+                processed_days += 1
+                log.info(
+                    "[BACKFILL] Processing %s (ZP=%s, ZT=%s)",
+                    current,
+                    "loaded" if zp_loaded else "missing",
+                    "loaded" if zt_loaded else "missing",
+                )
+                total_closed += _run_close_pass(
+                    cur,
+                    current,
+                    update_tracking=False,
+                    close_zp=zp_loaded,
+                    close_zt=zt_loaded,
+                )
+
+                if zp_loaded:
+                    created, skipped = _daily_zp_pass(
                         cur,
                         current,
-                        close_zp=zp_loaded,
-                        close_zt=zt_loaded,
+                        update_tracking=False,
+                        district_cache=district_cache,
                     )
+                    total_created["ZP"] += created
+                    total_skipped["ZP"] += skipped
+                if zt_loaded:
+                    created, skipped = _daily_zt_pass(
+                        cur,
+                        current,
+                        update_tracking=False,
+                        district_cache=district_cache,
+                    )
+                    total_created["ZT"] += created
+                    total_skipped["ZT"] += skipped
 
-                    if zp_loaded:
-                        created, skipped = _daily_zp_pass(cur, current)
-                        total_created["ZP"] += created
-                        total_skipped["ZP"] += skipped
-                    if zt_loaded:
-                        created, skipped = _daily_zt_pass(cur, current)
-                        total_created["ZT"] += created
-                        total_skipped["ZT"] += skipped
+                # A failed day is rolled back, while all prior days remain
+                # durable and can be reused by a resumed backfill.
+                conn.commit()
+                current += timedelta(days=1)
 
-                    current += timedelta(days=1)
-
-                refresh_tracking(cur)
+            refresh_tracking(cur)
+            conn.commit()
 
         log.info(
             "BACKFILL complete: days=%s, ZP created=%s skipped=%s, "
@@ -847,7 +897,8 @@ def backfill_pipeline(start_date: date, end_date: date | None = None) -> None:
             total_closed,
         )
     except Exception:
-        log.exception("BACKFILL failed - transaction rolled back")
+        conn.rollback()
+        log.exception("BACKFILL failed - current day rolled back; previous days remain committed")
         raise
     finally:
         conn.close()
