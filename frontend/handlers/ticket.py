@@ -222,6 +222,9 @@ async def process_text_input(update, context):
     elif context.user_data.get("manager_mode"):
         from handlers.management import process_manager_input
         await process_manager_input(update, context)
+    elif context.user_data.get("master_mode"):
+        from handlers.master_management import process_master_input
+        await process_master_input(update, context)
     elif context.user_data.get("waiting_ticket"):
         await select_ticket(update, context)
     elif context.user_data.get("waiting_rca"):

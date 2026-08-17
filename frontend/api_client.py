@@ -89,15 +89,24 @@ async def get_management_districts(telegram_id, npo=None):
     )
 
 
-async def get_management_analytics(telegram_id, npo=None, days=30):
+async def get_management_analytics(telegram_id, npo=None, days=30, as_role=None):
     params = {"days": days}
     if npo:
         params["district_id"] = npo
+    if as_role:
+        params["as_role"] = as_role
     return await _request(
         "GET",
         f"/management/analytics/{telegram_id}",
         params=params,
     )
+
+
+async def get_master_analytics(telegram_id, npo=None, days=30):
+    params = {"days": days}
+    if npo:
+        params["npo"] = npo
+    return await _request("GET", f"/master/analytics/{telegram_id}", params=params)
 
 
 async def get_management_details(telegram_id, district_id=None):

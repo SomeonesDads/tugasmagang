@@ -3,6 +3,7 @@ from telegram.ext import ContextTypes
 
 from api_client import BackendAPIError, get_identity
 from handlers.management import show_manager_dashboard
+from handlers.master_management import show_master_dashboard
 from handlers.ticket import show_ticket_dashboard
 
 
@@ -24,6 +25,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif identity["role"] == "manager":
         context.user_data["manager_mode"] = True
         await show_manager_dashboard(update, context)
+    elif identity["role"] == "master_manager":
+        await show_master_dashboard(update, context)
     else:
         await show_ticket_dashboard(update, context)
 
@@ -37,6 +40,12 @@ async def process_admin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("Pilih Manager atau Engineer.")
             return
         context.user_data["admin_view_role"] = normalized
+        if normalized == "manager":
+            # Admins use the global manager dashboard, so there is no NPO
+            # scope to collect before showing it.
+            context.user_data.pop("admin_setup_step", None)
+            await show_master_dashboard(update, context)
+            return
         context.user_data["admin_setup_step"] = "scope"
         await update.message.reply_text(
             "Masukkan departement_ns / NPO yang ingin digunakan:",
@@ -51,12 +60,6 @@ async def process_admin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         context.user_data["admin_view_district"] = scope
         context.user_data.pop("admin_setup_step", None)
-        if context.user_data["admin_view_role"] == "manager":
-            context.user_data["manager_mode"] = True
-            context.user_data["ticket_view_district"] = scope
-            context.user_data["ticket_view_role"] = "manager"
-            await show_manager_dashboard(update, context)
-        else:
-            context.user_data["ticket_view_district"] = scope
-            context.user_data["ticket_view_role"] = "engineer"
-            await show_ticket_dashboard(update, context)
+        context.user_data["ticket_view_district"] = scope
+        context.user_data["ticket_view_role"] = "engineer"
+        await show_ticket_dashboard(update, context)
